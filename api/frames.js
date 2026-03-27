@@ -7,7 +7,7 @@ let ffmpegPath;
 try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
 
 const MAX_VIDEO_DIM = 480;
-const MAX_VIDEO_FPS = 24;
+const MAX_VIDEO_FPS = 30;
 const MAX_GIF_DIM = 512;
 const MAX_RESPONSE = 4500000;
 const DEFAULT_DELAY = 100;
@@ -32,32 +32,6 @@ function makeTmp() {
   const d = path.join("/tmp", "f" + Date.now() + Math.random().toString(36).slice(2));
   fs.mkdirSync(d, { recursive: true });
   return d;
-}
-
-// Smart quality: pick resolution + fps to balance quality vs segment count
-function pickQuality(srcW, srcH, srcFps, duration) {
-  const maxDim = MAX_VIDEO_DIM;
-  let fps = Math.min(MAX_VIDEO_FPS, Math.round(srcFps));
-  const fit = fitSize(srcW, srcH, maxDim);
-  let w = fit.w, h = fit.h;
-  const fb = w * h * 4;
-
-  // If frame is huge and video is long, drop fps to keep segments reasonable
-  const framesPerSeg = Math.max(1, Math.floor(MAX_RESPONSE / fb));
-  const segSec = Math.min(framesPerSeg / fps, SEGMENT_SECONDS);
-  let totalSegs = Math.ceil(duration / segSec);
-
-  // If too many segments (>30), reduce fps first, then resolution
-  if (totalSegs > 40 && fps > 12) {
-    fps = 12;
-    const segSec2 = Math.min(framesPerSeg / fps, SEGMENT_SECONDS);
-    totalSegs = Math.ceil(duration / segSec2);
-  }
-  if (totalSegs > 60 && fps > 8) {
-    fps = 8;
-  }
-
-  return { w, h, fps };
 }
 
 async function processGif(buf) {
@@ -178,8 +152,10 @@ module.exports = async (req, res) => {
         const fm = probe.match(/(\d+(?:\.\d+)?)\s*fps/);
         if (fm) sf = parseFloat(fm[1]);
 
-        const q = pickQuality(sw, sh, sf, dur);
-        outW = q.w; outH = q.h; fps = q.fps;
+        fps = Math.min(MAX_VIDEO_FPS, Math.round(sf));
+        const fit = fitSize(sw, sh, MAX_VIDEO_DIM);
+        outW = fit.w;
+        outH = fit.h;
       }
 
       const fb = outW * outH * 4;

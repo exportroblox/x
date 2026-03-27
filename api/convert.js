@@ -17,9 +17,35 @@ module.exports = async (req, res) => {
     });
     if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
 
+    const contentType = resp.headers.get("content-type") || "";
     const buf = Buffer.from(await resp.arrayBuffer());
-    const meta = await sharp(buf).metadata();
+
+    // Check if it's a video by content-type
+    if (
+      contentType.startsWith("video/") ||
+      contentType.includes("mp4") ||
+      contentType.includes("webm")
+    ) {
+      return res.json({ type: "video", url });
+    }
+
+    // Try sharp
+    let meta;
+    try {
+      meta = await sharp(buf).metadata();
+    } catch {
+      // sharp can't read it — assume video
+      return res.json({ type: "video", url });
+    }
+
     if (!meta.width || !meta.height) throw new Error("Not an image");
+
+    // Animated GIF / WebP
+    if (meta.pages && meta.pages > 1) {
+      return res.json({ type: "animated", url, pages: meta.pages });
+    }
+
+    // Static image
     if (meta.width > MAX_DIM || meta.height > MAX_DIM)
       throw new Error(`Too large: ${meta.width}x${meta.height}`);
 
@@ -35,7 +61,6 @@ module.exports = async (req, res) => {
       .raw()
       .toBuffer({ resolveWithObject: true });
 
-    // Simple binary: 8 byte header + raw RGBA
     const header = Buffer.alloc(8);
     header.writeUInt32LE(info.width, 0);
     header.writeUInt32LE(info.height, 4);

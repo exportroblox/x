@@ -1,6 +1,6 @@
 const sharp = require("sharp");
 
-const TILE = 1024;
+const TILE = 4000;
 const MAX_DIM = 8192;
 const TARGET_MAX = 25000;
 

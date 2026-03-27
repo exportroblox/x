@@ -10,12 +10,12 @@ try {
   ffmpegPath = null;
 }
 
-const MAX_RES = 512;
-const MAX_FPS = 30;
-const MAX_DURATION = 30;
+// Hard limits (Vercel constraints)
+const VERCEL_TIMEOUT = 9;       // seconds, leave 1s headroom
+const VERCEL_MEMORY = 1024;     // MB
+const MAX_RAW_BYTES = 800 * 1024 * 1024; // 800MB raw frame budget
+const BATCH_TARGET = 500000;    // 500KB per batch response
 const DEFAULT_DELAY = 100;
-const MAX_FRAMES = 50000;
-const BATCH_SIZE_BYTES = 500000; // 500KB per batch = many small fast batches
 
 const cache = new Map();
 const CACHE_TTL = 180000;
@@ -27,7 +27,52 @@ function cleanCache() {
   }
 }
 
-async function processGif(buf) {
+function clampEven(n) {
+  n = Math.max(2, Math.round(n));
+  return n % 2 === 1 ? n + 1 : n;
+}
+
+// Calculate the best resolution and fps that fits in memory and time
+function calcSettings(srcW, srcH, srcFps, duration, userMaxRes, userMaxFps) {
+  let fps = Math.min(srcFps || 30, userMaxFps || 30);
+  let totalFrames = Math.ceil(duration * fps);
+
+  let outW = srcW;
+  let outH = srcH;
+
+  // Scale down if user requested max res
+  if (userMaxRes && (outW > userMaxRes || outH > userMaxRes)) {
+    const scale = Math.min(userMaxRes / outW, userMaxRes / outH);
+    outW = Math.round(outW * scale);
+    outH = Math.round(outH * scale);
+  }
+
+  // Check if total raw bytes fit in memory
+  let frameBytes = outW * outH * 4;
+  let totalBytes = frameBytes * totalFrames;
+
+  // If too much, reduce resolution first
+  while (totalBytes > MAX_RAW_BYTES && (outW > 64 || outH > 64)) {
+    outW = Math.round(outW * 0.8);
+    outH = Math.round(outH * 0.8);
+    frameBytes = outW * outH * 4;
+    totalBytes = frameBytes * totalFrames;
+  }
+
+  // If still too much, reduce fps
+  while (totalBytes > MAX_RAW_BYTES && fps > 5) {
+    fps = Math.max(5, fps - 5);
+    totalFrames = Math.ceil(duration * fps);
+    totalBytes = frameBytes * totalFrames;
+  }
+
+  outW = clampEven(outW);
+  outH = clampEven(outH);
+
+  return { outW, outH, fps, totalFrames };
+}
+
+async function processGif(buf, userMaxRes, userMaxFps) {
   const meta = await sharp(buf, { pages: -1 }).metadata();
   const pages = meta.pages || 1;
   const pageHeight = meta.pageHeight || meta.height;
@@ -43,11 +88,21 @@ async function processGif(buf) {
 
   let resizeW = meta.width;
   let resizeH = pageHeight;
-  if (resizeW > MAX_RES || resizeH > MAX_RES) {
-    const scale = Math.min(MAX_RES / resizeW, MAX_RES / resizeH);
+
+  if (userMaxRes && (resizeW > userMaxRes || resizeH > userMaxRes)) {
+    const scale = Math.min(userMaxRes / resizeW, userMaxRes / resizeH);
     resizeW = Math.round(resizeW * scale);
     resizeH = Math.round(resizeH * scale);
   }
+
+  // Check memory
+  let frameBytes = resizeW * resizeH * 4;
+  while (frameBytes * pages > MAX_RAW_BYTES && (resizeW > 64 || resizeH > 64)) {
+    resizeW = Math.round(resizeW * 0.8);
+    resizeH = Math.round(resizeH * 0.8);
+    frameBytes = resizeW * resizeH * 4;
+  }
+
   resizeW = Math.max(2, resizeW);
   resizeH = Math.max(2, resizeH);
 
@@ -60,14 +115,21 @@ async function processGif(buf) {
   const frameW = info.width;
   const totalH = info.height;
   const frameH = Math.round(totalH / pages);
-  const frameBytes = frameW * frameH * 4;
+  frameBytes = frameW * frameH * 4;
 
-  let frames = [];
-  let finalDelays = [];
+  // Subsample by fps if requested
+  let step = 1;
+  if (userMaxFps && delays.length > 0) {
+    const avgDelay = delays.reduce((a, b) => a + b, 0) / delays.length;
+    const srcFps = 1000 / Math.max(10, avgDelay);
+    if (userMaxFps < srcFps) {
+      step = Math.max(1, Math.round(srcFps / userMaxFps));
+    }
+  }
 
-  const step = pages > MAX_FRAMES ? Math.ceil(pages / MAX_FRAMES) : 1;
-
-  for (let i = 0; i < pages && frames.length < MAX_FRAMES; i += step) {
+  const frames = [];
+  const finalDelays = [];
+  for (let i = 0; i < pages; i += step) {
     const offset = i * frameBytes;
     if (offset + frameBytes > rawAll.length) break;
     const frameBuf = Buffer.alloc(frameBytes);
@@ -79,13 +141,16 @@ async function processGif(buf) {
   return {
     width: frameW,
     height: frameH,
+    srcWidth: meta.width,
+    srcHeight: pageHeight,
+    srcFps: Math.round(1000 / (delays[0] || 100)),
     frameCount: frames.length,
     delays: finalDelays,
     frames,
   };
 }
 
-function processVideo(buf) {
+function processVideo(buf, userMaxRes, userMaxFps) {
   if (!ffmpegPath) throw new Error("ffmpeg not available — install ffmpeg-static");
 
   const tmpDir = path.join(
@@ -97,17 +162,19 @@ function processVideo(buf) {
   fs.writeFileSync(inputPath, buf);
 
   try {
+    // Probe
     let probeOut = "";
     try {
-      probeOut = execSync(`${ffmpegPath} -i ${inputPath} -f null - 2>&1`, {
+      probeOut = execSync(`${ffmpegPath} -i ${inputPath} 2>&1`, {
         encoding: "utf8",
-        timeout: 5000,
+        timeout: 3000,
       });
     } catch (e) {
       probeOut = (e.stderr || e.stdout || e.message || "").toString();
     }
 
-    let duration = 10;
+    // Duration
+    let duration = 30;
     const durMatch = probeOut.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
     if (durMatch) {
       duration =
@@ -116,46 +183,53 @@ function processVideo(buf) {
         parseInt(durMatch[3]) +
         parseInt(durMatch[4]) / 100;
     }
-    duration = Math.min(duration, MAX_DURATION);
 
+    // Source dimensions
     const dimMatch = probeOut.match(/,\s*(\d{2,5})x(\d{2,5})/);
-    let srcW = 320,
-      srcH = 240;
+    let srcW = 640, srcH = 480;
     if (dimMatch) {
       srcW = parseInt(dimMatch[1]);
       srcH = parseInt(dimMatch[2]);
     }
 
-    let outW = srcW,
-      outH = srcH;
-    if (outW > MAX_RES || outH > MAX_RES) {
-      const scale = Math.min(MAX_RES / outW, MAX_RES / outH);
-      outW = Math.round(outW * scale);
-      outH = Math.round(outH * scale);
+    // Source FPS
+    let srcFps = 30;
+    const fpsMatch = probeOut.match(/(\d+(?:\.\d+)?)\s*fps/);
+    if (fpsMatch) {
+      srcFps = parseFloat(fpsMatch[1]);
     }
-    outW = outW % 2 === 1 ? outW + 1 : outW;
-    outH = outH % 2 === 1 ? outH + 1 : outH;
-    outW = Math.max(2, outW);
-    outH = Math.max(2, outH);
 
+    // Calculate optimal settings
+    const settings = calcSettings(
+      srcW, srcH, srcFps, duration,
+      userMaxRes || srcW,  // if no max, use source
+      userMaxFps || srcFps // if no max, use source
+    );
+
+    const { outW, outH, fps, totalFrames } = settings;
     const rawPath = path.join(tmpDir, "out.raw");
+
+    // Calculate timeout: give ffmpeg proportional time but cap it
+    const ffmpegTimeout = Math.min(
+      Math.max(Math.ceil(duration * 1.5), 5) * 1000,
+      VERCEL_TIMEOUT * 1000
+    );
 
     execSync(
       `${ffmpegPath} -y -i ${inputPath} -t ${duration} ` +
-        `-vf "scale=${outW}:${outH},fps=${MAX_FPS}" ` +
+        `-vf "scale=${outW}:${outH},fps=${fps}" ` +
         `-pix_fmt rgba -f rawvideo ${rawPath}`,
-      { timeout: 8000 }
+      { timeout: ffmpegTimeout }
     );
 
     if (!fs.existsSync(rawPath)) throw new Error("ffmpeg produced no output");
     const rawData = fs.readFileSync(rawPath);
     const frameBytes = outW * outH * 4;
-    let actualFrames = Math.floor(rawData.length / frameBytes);
-    actualFrames = Math.min(actualFrames, MAX_FRAMES);
+    const actualFrames = Math.floor(rawData.length / frameBytes);
 
     if (actualFrames === 0) throw new Error("No frames extracted");
 
-    const delayMs = Math.round(1000 / MAX_FPS);
+    const delayMs = Math.round(1000 / fps);
     const frames = [];
     const delays = [];
     for (let i = 0; i < actualFrames; i++) {
@@ -166,7 +240,16 @@ function processVideo(buf) {
       delays.push(delayMs);
     }
 
-    return { width: outW, height: outH, frameCount: actualFrames, delays, frames };
+    return {
+      width: outW,
+      height: outH,
+      srcWidth: srcW,
+      srcHeight: srcH,
+      srcFps: Math.round(srcFps),
+      frameCount: actualFrames,
+      delays,
+      frames,
+    };
   } finally {
     try {
       fs.rmSync(tmpDir, { recursive: true, force: true });
@@ -177,17 +260,23 @@ function processVideo(buf) {
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  const { url, batch } = req.query;
+  const { url, batch, maxres, maxfps } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
+
+  const userMaxRes = maxres ? parseInt(maxres) : undefined;
+  const userMaxFps = maxfps ? parseInt(maxfps) : undefined;
+
+  // Cache key includes quality settings
+  const cacheKey = `${url}|${userMaxRes || "auto"}|${userMaxFps || "auto"}`;
 
   try {
     cleanCache();
-    let cached = cache.get(url);
+    let cached = cache.get(cacheKey);
 
     if (!cached) {
       const resp = await fetch(url, {
         headers: { "User-Agent": "Mozilla/5.0" },
-        signal: AbortSignal.timeout(5000),
+        signal: AbortSignal.timeout(4000),
       });
       if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
 
@@ -201,14 +290,13 @@ module.exports = async (req, res) => {
 
       let result;
       if (isAnimated) {
-        result = await processGif(buf);
+        result = await processGif(buf, userMaxRes, userMaxFps);
       } else {
-        result = processVideo(buf);
+        result = processVideo(buf, userMaxRes, userMaxFps);
       }
 
       const frameBytes = result.width * result.height * 4;
-      // Many small batches for maximum parallelism
-      const framesPerBatch = Math.max(1, Math.floor(BATCH_SIZE_BYTES / frameBytes));
+      const framesPerBatch = Math.max(1, Math.floor(BATCH_TARGET / frameBytes));
 
       cached = {
         ...result,
@@ -216,7 +304,7 @@ module.exports = async (req, res) => {
         totalBatches: Math.ceil(result.frameCount / framesPerBatch),
         time: Date.now(),
       };
-      cache.set(url, cached);
+      cache.set(cacheKey, cached);
     } else {
       cached.time = Date.now();
     }
@@ -225,6 +313,9 @@ module.exports = async (req, res) => {
       return res.json({
         width: cached.width,
         height: cached.height,
+        srcWidth: cached.srcWidth,
+        srcHeight: cached.srcHeight,
+        srcFps: cached.srcFps,
         frameCount: cached.frameCount,
         delays: cached.delays,
         framesPerBatch: cached.framesPerBatch,

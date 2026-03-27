@@ -11,38 +11,64 @@ module.exports = async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
   try {
-    const resp = await fetch(url, {
-      headers: { "User-Agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
+    // Quick HEAD request first to check content type without downloading
+    let contentType = "";
+    try {
+      const head = await fetch(url, {
+        method: "HEAD",
+        headers: { "User-Agent": "Mozilla/5.0" },
+        signal: AbortSignal.timeout(5000),
+      });
+      contentType = (head.headers.get("content-type") || "").toLowerCase();
+    } catch {
+      // HEAD failed, try GET below
+    }
 
-    const contentType = resp.headers.get("content-type") || "";
-    const buf = Buffer.from(await resp.arrayBuffer());
-
-    // Check if it's a video by content-type
+    // If it's clearly a video, don't download at all
     if (
       contentType.startsWith("video/") ||
       contentType.includes("mp4") ||
-      contentType.includes("webm")
+      contentType.includes("webm") ||
+      contentType.includes("quicktime") ||
+      contentType.includes("matroska")
     ) {
-      return res.json({ type: "video", url });
+      return res.json({ type: "video" });
     }
 
-    // Try sharp
+    // Check URL extension as fallback
+    const lower = url.toLowerCase().split("?")[0];
+    if (
+      lower.endsWith(".mp4") ||
+      lower.endsWith(".mov") ||
+      lower.endsWith(".webm") ||
+      lower.endsWith(".mkv") ||
+      lower.endsWith(".avi")
+    ) {
+      return res.json({ type: "video" });
+    }
+
+    // Download and try as image
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
+
+    const buf = Buffer.from(await resp.arrayBuffer());
+
     let meta;
     try {
       meta = await sharp(buf).metadata();
     } catch {
       // sharp can't read it — assume video
-      return res.json({ type: "video", url });
+      return res.json({ type: "video" });
     }
 
     if (!meta.width || !meta.height) throw new Error("Not an image");
 
-    // Animated GIF / WebP
+    // Animated GIF/WebP
     if (meta.pages && meta.pages > 1) {
-      return res.json({ type: "animated", url, pages: meta.pages });
+      return res.json({ type: "animated" });
     }
 
     // Static image

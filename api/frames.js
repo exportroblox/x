@@ -12,8 +12,8 @@ try {
 
 const MAX_RAW_PER_REQUEST = 4000000;
 const DEFAULT_DELAY = 100;
-const SEGMENT_DURATION = 3;
-const MAX_FRAME_DIM = 1024; // EditableImage limit
+const SEGMENT_DURATION = 5;
+const MAX_FRAME_DIM = 1024;
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
@@ -47,7 +47,6 @@ async function processGif(buf, userMaxRes) {
   const maxRes = Math.min(userMaxRes || MAX_FRAME_DIM, MAX_FRAME_DIM);
   let { w: resizeW, h: resizeH } = fitSize(meta.width, pageHeight, maxRes);
 
-  // Memory guard
   let frameBytes = resizeW * resizeH * 4;
   while (frameBytes * pages > 500 * 1024 * 1024 && (resizeW > 64 || resizeH > 64)) {
     resizeW = clampEven(Math.round(resizeW * 0.7));
@@ -77,7 +76,6 @@ async function processGif(buf, userMaxRes) {
   }
 
   return {
-    type: "gif_complete",
     width: frameW,
     height: frameH,
     srcWidth: meta.width,
@@ -88,98 +86,50 @@ async function processGif(buf, userMaxRes) {
   };
 }
 
-function probeVideo(buf) {
-  if (!ffmpegPath) throw new Error("ffmpeg not available");
-
-  const tmpDir = path.join("/tmp", "probe_" + Date.now() + "_" + Math.random().toString(36).slice(2));
-  fs.mkdirSync(tmpDir, { recursive: true });
-  const inputPath = path.join(tmpDir, "input");
-  fs.writeFileSync(inputPath, buf);
-
+function probeVideo(inputPath) {
+  let probeOut = "";
   try {
-    let probeOut = "";
-    try {
-      probeOut = execSync(`${ffmpegPath} -i ${inputPath} 2>&1`, {
-        encoding: "utf8",
-        timeout: 3000,
-      });
-    } catch (e) {
-      probeOut = (e.stderr || e.stdout || e.message || "").toString();
-    }
-
-    let duration = 10;
-    const durMatch = probeOut.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
-    if (durMatch) {
-      duration =
-        parseInt(durMatch[1]) * 3600 +
-        parseInt(durMatch[2]) * 60 +
-        parseInt(durMatch[3]) +
-        parseInt(durMatch[4]) / 100;
-    }
-
-    const dimMatch = probeOut.match(/,\s*(\d{2,5})x(\d{2,5})/);
-    let srcW = 640, srcH = 480;
-    if (dimMatch) {
-      srcW = parseInt(dimMatch[1]);
-      srcH = parseInt(dimMatch[2]);
-    }
-
-    let srcFps = 30;
-    const fpsMatch = probeOut.match(/(\d+(?:\.\d+)?)\s*fps/);
-    if (fpsMatch) srcFps = parseFloat(fpsMatch[1]);
-
-    return { duration, srcW, srcH, srcFps };
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+    probeOut = execSync(`${ffmpegPath} -i ${inputPath} 2>&1`, {
+      encoding: "utf8",
+      timeout: 3000,
+    });
+  } catch (e) {
+    probeOut = (e.stderr || e.stdout || e.message || "").toString();
   }
+
+  let duration = 10;
+  const durMatch = probeOut.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
+  if (durMatch) {
+    duration =
+      parseInt(durMatch[1]) * 3600 +
+      parseInt(durMatch[2]) * 60 +
+      parseInt(durMatch[3]) +
+      parseInt(durMatch[4]) / 100;
+  }
+
+  const dimMatch = probeOut.match(/,\s*(\d{2,5})x(\d{2,5})/);
+  let srcW = 640,
+    srcH = 480;
+  if (dimMatch) {
+    srcW = parseInt(dimMatch[1]);
+    srcH = parseInt(dimMatch[2]);
+  }
+
+  let srcFps = 30;
+  const fpsMatch = probeOut.match(/(\d+(?:\.\d+)?)\s*fps/);
+  if (fpsMatch) srcFps = parseFloat(fpsMatch[1]);
+
+  return { duration, srcW, srcH, srcFps };
 }
 
 function calcOutputSize(srcW, srcH, userMaxRes) {
   const maxRes = Math.min(userMaxRes || MAX_FRAME_DIM, MAX_FRAME_DIM);
   let { w, h } = fitSize(srcW, srcH, maxRes);
-  // Extra memory guard: max ~4MB per frame
   while (w * h * 4 > 4 * 1024 * 1024) {
     w = clampEven(Math.round(w * 0.8));
     h = clampEven(Math.round(h * 0.8));
   }
   return { w, h };
-}
-
-function extractSegment(buf, startTime, segDuration, outW, outH, fps) {
-  const tmpDir = path.join("/tmp", "seg_" + Date.now() + "_" + Math.random().toString(36).slice(2));
-  fs.mkdirSync(tmpDir, { recursive: true });
-  const inputPath = path.join(tmpDir, "input");
-  const rawPath = path.join(tmpDir, "out.raw");
-  fs.writeFileSync(inputPath, buf);
-
-  try {
-    execSync(
-      `${ffmpegPath} -y -ss ${startTime.toFixed(3)} -i ${inputPath} -t ${segDuration.toFixed(3)} ` +
-        `-vf "scale=${outW}:${outH},fps=${fps}" ` +
-        `-pix_fmt rgba -f rawvideo ${rawPath}`,
-      { timeout: 8000 }
-    );
-
-    if (!fs.existsSync(rawPath)) return [];
-
-    const rawData = fs.readFileSync(rawPath);
-    const frameBytes = outW * outH * 4;
-    const count = Math.floor(rawData.length / frameBytes);
-
-    const frames = [];
-    for (let i = 0; i < count; i++) {
-      const offset = i * frameBytes;
-      const frameBuf = Buffer.alloc(frameBytes);
-      rawData.copy(frameBuf, 0, offset, offset + frameBytes);
-      frames.push(frameBuf);
-    }
-    return frames;
-  } catch (e) {
-    console.error("segment extract error:", e.message);
-    return [];
-  } finally {
-    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
-  }
 }
 
 module.exports = async (req, res) => {
@@ -197,6 +147,7 @@ module.exports = async (req, res) => {
 
     const buf = Buffer.from(await resp.arrayBuffer());
 
+    // Check animated image
     let isAnimated = false;
     try {
       const meta = await sharp(buf).metadata();
@@ -212,6 +163,7 @@ module.exports = async (req, res) => {
 
       if (segment !== undefined) {
         const si = parseInt(segment);
+        if (si < 0 || si >= totalBatches) throw new Error("Segment out of range");
         const start = si * framesPerBatch;
         const end = Math.min(start + framesPerBatch, result.frameCount);
         const count = end - start;
@@ -241,62 +193,120 @@ module.exports = async (req, res) => {
     }
 
     // ── Video ──
-    const probe = probeVideo(buf);
-    const { w: outW, h: outH } = calcOutputSize(
-      probe.srcW, probe.srcH,
-      maxres ? parseInt(maxres) : undefined
+    if (!ffmpegPath) throw new Error("ffmpeg not available");
+
+    const tmpDir = path.join(
+      "/tmp",
+      "v_" + Date.now() + "_" + Math.random().toString(36).slice(2)
     );
-    const fps = maxfps
-      ? Math.min(parseInt(maxfps), Math.round(probe.srcFps))
-      : Math.min(30, Math.round(probe.srcFps));
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const inputPath = path.join(tmpDir, "input");
+    fs.writeFileSync(inputPath, buf);
 
-    if (segment === undefined) {
-      const totalSegments = Math.ceil(probe.duration / SEGMENT_DURATION);
-      const estFrames = Math.ceil(probe.duration * fps);
-      const delayMs = Math.round(1000 / fps);
-      const delays = [];
-      for (let i = 0; i < estFrames; i++) delays.push(delayMs);
+    try {
+      // ── Info mode (no segment param) ──
+      if (segment === undefined) {
+        const probe = probeVideo(inputPath);
+        const { w: outW, h: outH } = calcOutputSize(
+          probe.srcW,
+          probe.srcH,
+          maxres ? parseInt(maxres) : undefined
+        );
+        const fps = maxfps
+          ? Math.min(parseInt(maxfps), Math.round(probe.srcFps))
+          : Math.min(30, Math.round(probe.srcFps));
+        const totalSegments = Math.ceil(probe.duration / SEGMENT_DURATION);
+        const estFrames = Math.ceil(probe.duration * fps);
+        const delayMs = Math.round(1000 / fps);
+        const delays = [];
+        for (let i = 0; i < estFrames; i++) delays.push(delayMs);
 
-      return res.json({
-        format: "video",
-        width: outW,
-        height: outH,
-        srcWidth: probe.srcW,
-        srcHeight: probe.srcH,
-        srcFps: Math.round(probe.srcFps),
-        fps,
-        duration: probe.duration,
-        frameCount: estFrames,
-        delays,
-        totalSegments,
-        segmentDuration: SEGMENT_DURATION,
-      });
-    }
+        return res.json({
+          format: "video",
+          width: outW,
+          height: outH,
+          srcWidth: probe.srcW,
+          srcHeight: probe.srcH,
+          srcFps: Math.round(probe.srcFps),
+          fps,
+          duration: probe.duration,
+          frameCount: estFrames,
+          delays,
+          totalSegments,
+          segmentDuration: SEGMENT_DURATION,
+        });
+      }
 
-    const si = parseInt(segment);
-    const startTime = si * SEGMENT_DURATION;
-    const segDur = Math.min(SEGMENT_DURATION, probe.duration - startTime);
+      // ── Segment mode ──
+      const si = parseInt(segment);
+      let outW, outH, fps, totalDuration;
 
-    if (segDur <= 0) {
-      const out = Buffer.alloc(4);
-      out.writeUInt32LE(0, 0);
+      // Fast path: dimensions passed as query params, skip probe
+      if (req.query.ow && req.query.oh && req.query.ofps && req.query.dur) {
+        outW = parseInt(req.query.ow);
+        outH = parseInt(req.query.oh);
+        fps = parseInt(req.query.ofps);
+        totalDuration = parseFloat(req.query.dur);
+      } else {
+        // Slow fallback: probe
+        const probe = probeVideo(inputPath);
+        const calc = calcOutputSize(
+          probe.srcW,
+          probe.srcH,
+          maxres ? parseInt(maxres) : undefined
+        );
+        outW = calc.w;
+        outH = calc.h;
+        fps = maxfps
+          ? Math.min(parseInt(maxfps), Math.round(probe.srcFps))
+          : Math.min(30, Math.round(probe.srcFps));
+        totalDuration = probe.duration;
+      }
+
+      const startTime = si * SEGMENT_DURATION;
+      const segDur = Math.min(SEGMENT_DURATION, totalDuration - startTime);
+
+      if (segDur <= 0) {
+        const out = Buffer.alloc(4);
+        out.writeUInt32LE(0, 0);
+        res.setHeader("Content-Type", "application/octet-stream");
+        return res.send(out);
+      }
+
+      const rawPath = path.join(tmpDir, "out.raw");
+      execSync(
+        `${ffmpegPath} -y -ss ${startTime.toFixed(3)} -i ${inputPath} -t ${segDur.toFixed(3)} ` +
+          `-vf "scale=${outW}:${outH},fps=${fps}" ` +
+          `-pix_fmt rgba -f rawvideo ${rawPath}`,
+        { timeout: 8000 }
+      );
+
+      const frameBytes = outW * outH * 4;
+      if (!fs.existsSync(rawPath)) {
+        const out = Buffer.alloc(4);
+        out.writeUInt32LE(0, 0);
+        res.setHeader("Content-Type", "application/octet-stream");
+        return res.send(out);
+      }
+
+      const rawData = fs.readFileSync(rawPath);
+      const count = Math.floor(rawData.length / frameBytes);
+
+      const out = Buffer.alloc(4 + frameBytes * count);
+      out.writeUInt32LE(count, 0);
+      let offset = 4;
+      for (let i = 0; i < count; i++) {
+        rawData.copy(out, offset, i * frameBytes, (i + 1) * frameBytes);
+        offset += frameBytes;
+      }
+
       res.setHeader("Content-Type", "application/octet-stream");
       return res.send(out);
+    } finally {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {}
     }
-
-    const frames = extractSegment(buf, startTime, segDur, outW, outH, fps);
-    const frameBytes = outW * outH * 4;
-
-    const out = Buffer.alloc(4 + frameBytes * frames.length);
-    out.writeUInt32LE(frames.length, 0);
-    let offset = 4;
-    for (const frame of frames) {
-      frame.copy(out, offset, 0, frameBytes);
-      offset += frameBytes;
-    }
-
-    res.setHeader("Content-Type", "application/octet-stream");
-    return res.send(out);
   } catch (e) {
     console.error("frames error:", e.message);
     return res.status(500).json({ error: e.message });

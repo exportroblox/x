@@ -11,7 +11,6 @@ module.exports = async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
   try {
-    // Quick HEAD request first to check content type without downloading
     let contentType = "";
     try {
       const head = await fetch(url, {
@@ -20,11 +19,8 @@ module.exports = async (req, res) => {
         signal: AbortSignal.timeout(5000),
       });
       contentType = (head.headers.get("content-type") || "").toLowerCase();
-    } catch {
-      // HEAD failed, try GET below
-    }
+    } catch {}
 
-    // If it's clearly a video, don't download at all
     if (
       contentType.startsWith("video/") ||
       contentType.includes("mp4") ||
@@ -35,7 +31,6 @@ module.exports = async (req, res) => {
       return res.json({ type: "video" });
     }
 
-    // Check URL extension as fallback
     const lower = url.toLowerCase().split("?")[0];
     if (
       lower.endsWith(".mp4") ||
@@ -47,7 +42,6 @@ module.exports = async (req, res) => {
       return res.json({ type: "video" });
     }
 
-    // Download and try as image
     const resp = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       signal: AbortSignal.timeout(10000),
@@ -60,18 +54,15 @@ module.exports = async (req, res) => {
     try {
       meta = await sharp(buf).metadata();
     } catch {
-      // sharp can't read it — assume video
       return res.json({ type: "video" });
     }
 
     if (!meta.width || !meta.height) throw new Error("Not an image");
 
-    // Animated GIF/WebP
     if (meta.pages && meta.pages > 1) {
       return res.json({ type: "animated" });
     }
 
-    // Static image
     if (meta.width > MAX_DIM || meta.height > MAX_DIM)
       throw new Error(`Too large: ${meta.width}x${meta.height}`);
 

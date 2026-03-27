@@ -1,8 +1,7 @@
 const sharp = require("sharp");
 
-const TILE = 4000;
-const MAX_DIM = 8192;
-const TARGET_MAX = 25000;
+const MAX_DIM = 25000;
+const TARGET_MAX = 4096;
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -19,10 +18,10 @@ module.exports = async (req, res) => {
     if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
 
     const buf = Buffer.from(await resp.arrayBuffer());
-    let meta = await sharp(buf).metadata();
+    const meta = await sharp(buf).metadata();
     if (!meta.width || !meta.height) throw new Error("Not an image");
     if (meta.width > MAX_DIM || meta.height > MAX_DIM)
-      throw new Error(`Too large: ${meta.width}x${meta.height}, max ${MAX_DIM}`);
+      throw new Error(`Too large: ${meta.width}x${meta.height}`);
 
     let pipeline = sharp(buf).ensureAlpha();
     if (meta.width > TARGET_MAX || meta.height > TARGET_MAX) {
@@ -32,57 +31,17 @@ module.exports = async (req, res) => {
       });
     }
 
-    const { data: fullRaw, info } = await pipeline
+    const { data, info } = await pipeline
       .raw()
       .toBuffer({ resolveWithObject: true });
 
-    const fullW = info.width;
-    const fullH = info.height;
-    const tilesX = Math.ceil(fullW / TILE);
-    const tilesY = Math.ceil(fullH / TILE);
-
-    // Calculate total binary size
-    let totalSize = 20;
-    for (let ty = 0; ty < tilesY; ty++) {
-      for (let tx = 0; tx < tilesX; tx++) {
-        const tw = Math.min(TILE, fullW - tx * TILE);
-        const th = Math.min(TILE, fullH - ty * TILE);
-        totalSize += 8 + tw * th * 4;
-      }
-    }
-
-    const out = Buffer.alloc(totalSize);
-    let offset = 0;
-
-    out.writeUInt32LE(fullW, 0);
-    out.writeUInt32LE(fullH, 4);
-    out.writeUInt32LE(TILE, 8);
-    out.writeUInt32LE(tilesX, 12);
-    out.writeUInt32LE(tilesY, 16);
-    offset = 20;
-
-    const stride = fullW * 4;
-    for (let ty = 0; ty < tilesY; ty++) {
-      for (let tx = 0; tx < tilesX; tx++) {
-        const left = tx * TILE;
-        const top = ty * TILE;
-        const tw = Math.min(TILE, fullW - left);
-        const th = Math.min(TILE, fullH - top);
-
-        out.writeUInt32LE(tw, offset);
-        out.writeUInt32LE(th, offset + 4);
-        offset += 8;
-
-        for (let row = 0; row < th; row++) {
-          const srcOff = (top + row) * stride + left * 4;
-          fullRaw.copy(out, offset, srcOff, srcOff + tw * 4);
-          offset += tw * 4;
-        }
-      }
-    }
+    // Simple binary: 8 byte header + raw RGBA
+    const header = Buffer.alloc(8);
+    header.writeUInt32LE(info.width, 0);
+    header.writeUInt32LE(info.height, 4);
 
     res.setHeader("Content-Type", "application/octet-stream");
-    return res.send(out);
+    return res.send(Buffer.concat([header, data]));
   } catch (e) {
     return res.status(500).json({ error: e.message });
   }

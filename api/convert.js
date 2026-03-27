@@ -2,7 +2,7 @@ const sharp = require("sharp");
 
 const TILE = 1024;
 const MAX_DIM = 8192;
-const TARGET_MAX = 4096;
+const TARGET_MAX = 25000;
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");

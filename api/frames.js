@@ -4,16 +4,13 @@ const fs = require("fs");
 const path = require("path");
 
 let ffmpegPath;
-try {
-  ffmpegPath = require("ffmpeg-static");
-} catch {
-  ffmpegPath = null;
-}
+try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
 
-const MAX_RAW_PER_REQUEST = 4000000;
+const MAX_VIDEO_DIM = 320;
+const MAX_VIDEO_FPS = 10;
+const MAX_GIF_DIM = 512;
+const MAX_RESPONSE = 3500000; // 3.5MB safety margin under Vercel's 4.5MB limit
 const DEFAULT_DELAY = 100;
-const SEGMENT_DURATION = 5;
-const MAX_FRAME_DIM = 1024;
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
@@ -23,248 +20,161 @@ function clampEven(n) {
 function fitSize(srcW, srcH, maxDim) {
   let w = srcW, h = srcH;
   if (w > maxDim || h > maxDim) {
-    const scale = Math.min(maxDim / w, maxDim / h);
-    w = Math.round(w * scale);
-    h = Math.round(h * scale);
+    const s = Math.min(maxDim / w, maxDim / h);
+    w = Math.round(w * s);
+    h = Math.round(h * s);
   }
   return { w: clampEven(Math.max(2, w)), h: clampEven(Math.max(2, h)) };
 }
 
-async function processGif(buf, userMaxRes) {
+function makeTmp() {
+  const d = path.join("/tmp", "f" + Date.now() + Math.random().toString(36).slice(2));
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+async function processGif(buf) {
   const meta = await sharp(buf, { pages: -1 }).metadata();
   const pages = meta.pages || 1;
-  const pageHeight = meta.pageHeight || meta.height;
-
+  const pageH = meta.pageHeight || meta.height;
   const delays = [];
-  for (let i = 0; i < pages; i++) {
-    delays.push(
-      meta.delay && Array.isArray(meta.delay) && meta.delay[i]
-        ? meta.delay[i]
-        : DEFAULT_DELAY
-    );
+  for (let i = 0; i < pages; i++) delays.push(meta.delay?.[i] || DEFAULT_DELAY);
+
+  let { w, h } = fitSize(meta.width, pageH, MAX_GIF_DIM);
+  let fb = w * h * 4;
+  while (fb * pages > 400 * 1024 * 1024 && w > 64) {
+    w = clampEven(Math.round(w * 0.7));
+    h = clampEven(Math.round(h * 0.7));
+    fb = w * h * 4;
   }
 
-  const maxRes = Math.min(userMaxRes || MAX_FRAME_DIM, MAX_FRAME_DIM);
-  let { w: resizeW, h: resizeH } = fitSize(meta.width, pageHeight, maxRes);
-
-  let frameBytes = resizeW * resizeH * 4;
-  while (frameBytes * pages > 500 * 1024 * 1024 && (resizeW > 64 || resizeH > 64)) {
-    resizeW = clampEven(Math.round(resizeW * 0.7));
-    resizeH = clampEven(Math.round(resizeH * 0.7));
-    frameBytes = resizeW * resizeH * 4;
-  }
-
-  const { data: rawAll, info } = await sharp(buf, { pages: -1 })
-    .resize(resizeW, resizeH, { fit: "fill" })
-    .ensureAlpha()
-    .raw()
+  const { data, info } = await sharp(buf, { pages: -1 })
+    .resize(w, h, { fit: "fill" }).ensureAlpha().raw()
     .toBuffer({ resolveWithObject: true });
 
   const frameW = info.width;
   const frameH = Math.round(info.height / pages);
-  frameBytes = frameW * frameH * 4;
+  fb = frameW * frameH * 4;
 
-  const frames = [];
-  const finalDelays = [];
+  const frames = [], finalDelays = [];
   for (let i = 0; i < pages; i++) {
-    const offset = i * frameBytes;
-    if (offset + frameBytes > rawAll.length) break;
-    const frameBuf = Buffer.alloc(frameBytes);
-    rawAll.copy(frameBuf, 0, offset, offset + frameBytes);
-    frames.push(frameBuf);
+    const off = i * fb;
+    if (off + fb > data.length) break;
+    const f = Buffer.alloc(fb);
+    data.copy(f, 0, off, off + fb);
+    frames.push(f);
     finalDelays.push(delays[i]);
   }
 
+  const fpb = Math.max(1, Math.floor(MAX_RESPONSE / fb));
   return {
-    width: frameW,
-    height: frameH,
-    srcWidth: meta.width,
-    srcHeight: pageHeight,
-    frameCount: frames.length,
-    delays: finalDelays,
-    frames,
+    width: frameW, height: frameH, frameCount: frames.length,
+    delays: finalDelays, frames, framesPerBatch: fpb,
+    totalBatches: Math.ceil(frames.length / fpb),
   };
-}
-
-function probeVideo(inputPath) {
-  let probeOut = "";
-  try {
-    probeOut = execSync(`${ffmpegPath} -i ${inputPath} 2>&1`, {
-      encoding: "utf8",
-      timeout: 3000,
-    });
-  } catch (e) {
-    probeOut = (e.stderr || e.stdout || e.message || "").toString();
-  }
-
-  let duration = 10;
-  const durMatch = probeOut.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
-  if (durMatch) {
-    duration =
-      parseInt(durMatch[1]) * 3600 +
-      parseInt(durMatch[2]) * 60 +
-      parseInt(durMatch[3]) +
-      parseInt(durMatch[4]) / 100;
-  }
-
-  const dimMatch = probeOut.match(/,\s*(\d{2,5})x(\d{2,5})/);
-  let srcW = 640,
-    srcH = 480;
-  if (dimMatch) {
-    srcW = parseInt(dimMatch[1]);
-    srcH = parseInt(dimMatch[2]);
-  }
-
-  let srcFps = 30;
-  const fpsMatch = probeOut.match(/(\d+(?:\.\d+)?)\s*fps/);
-  if (fpsMatch) srcFps = parseFloat(fpsMatch[1]);
-
-  return { duration, srcW, srcH, srcFps };
-}
-
-function calcOutputSize(srcW, srcH, userMaxRes) {
-  const maxRes = Math.min(userMaxRes || MAX_FRAME_DIM, MAX_FRAME_DIM);
-  let { w, h } = fitSize(srcW, srcH, maxRes);
-  while (w * h * 4 > 4 * 1024 * 1024) {
-    w = clampEven(Math.round(w * 0.8));
-    h = clampEven(Math.round(h * 0.8));
-  }
-  return { w, h };
 }
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
-
-  const { url, segment, maxres, maxfps } = req.query;
+  const { url, segment } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
   try {
     const resp = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(5000),
+      signal: AbortSignal.timeout(6000),
     });
     if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
-
     const buf = Buffer.from(await resp.arrayBuffer());
 
-    // Check animated image
-    let isAnimated = false;
-    try {
-      const meta = await sharp(buf).metadata();
-      if (meta.pages && meta.pages > 1) isAnimated = true;
-    } catch {}
+    let isAnim = false;
+    try { const m = await sharp(buf).metadata(); if (m.pages > 1) isAnim = true; } catch {}
 
     // ── GIF ──
-    if (isAnimated) {
-      const result = await processGif(buf, maxres ? parseInt(maxres) : undefined);
-      const frameBytes = result.width * result.height * 4;
-      const framesPerBatch = Math.max(1, Math.floor(MAX_RAW_PER_REQUEST / frameBytes));
-      const totalBatches = Math.ceil(result.frameCount / framesPerBatch);
+    if (isAnim) {
+      const gif = await processGif(buf);
+      const fb = gif.width * gif.height * 4;
 
-      if (segment !== undefined) {
-        const si = parseInt(segment);
-        if (si < 0 || si >= totalBatches) throw new Error("Segment out of range");
-        const start = si * framesPerBatch;
-        const end = Math.min(start + framesPerBatch, result.frameCount);
-        const count = end - start;
-
-        const out = Buffer.alloc(4 + frameBytes * count);
-        out.writeUInt32LE(count, 0);
-        let offset = 4;
-        for (let i = start; i < end; i++) {
-          result.frames[i].copy(out, offset, 0, frameBytes);
-          offset += frameBytes;
-        }
-        res.setHeader("Content-Type", "application/octet-stream");
-        return res.send(out);
+      if (segment === undefined) {
+        return res.json({
+          format: "gif", width: gif.width, height: gif.height,
+          frameCount: gif.frameCount, delays: gif.delays,
+          totalSegments: gif.totalBatches,
+        });
       }
 
-      return res.json({
-        format: "gif",
-        width: result.width,
-        height: result.height,
-        srcWidth: result.srcWidth,
-        srcHeight: result.srcHeight,
-        srcFps: 0,
-        frameCount: result.frameCount,
-        delays: result.delays,
-        totalSegments: totalBatches,
-      });
+      const si = parseInt(segment);
+      const start = si * gif.framesPerBatch;
+      const end2 = Math.min(start + gif.framesPerBatch, gif.frameCount);
+      const count = end2 - start;
+      const out = Buffer.alloc(4 + fb * count);
+      out.writeUInt32LE(count, 0);
+      let off = 4;
+      for (let i = start; i < end2; i++) { gif.frames[i].copy(out, off, 0, fb); off += fb; }
+      res.setHeader("Content-Type", "application/octet-stream");
+      return res.send(out);
     }
 
     // ── Video ──
     if (!ffmpegPath) throw new Error("ffmpeg not available");
-
-    const tmpDir = path.join(
-      "/tmp",
-      "v_" + Date.now() + "_" + Math.random().toString(36).slice(2)
-    );
-    fs.mkdirSync(tmpDir, { recursive: true });
-    const inputPath = path.join(tmpDir, "input");
-    fs.writeFileSync(inputPath, buf);
+    const dir = makeTmp();
+    const inp = path.join(dir, "in");
+    fs.writeFileSync(inp, buf);
 
     try {
-      // ── Info mode (no segment param) ──
-      if (segment === undefined) {
-        const probe = probeVideo(inputPath);
-        const { w: outW, h: outH } = calcOutputSize(
-          probe.srcW,
-          probe.srcH,
-          maxres ? parseInt(maxres) : undefined
-        );
-        const fps = maxfps
-          ? Math.min(parseInt(maxfps), Math.round(probe.srcFps))
-          : Math.min(30, Math.round(probe.srcFps));
-        const totalSegments = Math.ceil(probe.duration / SEGMENT_DURATION);
-        const estFrames = Math.ceil(probe.duration * fps);
-        const delayMs = Math.round(1000 / fps);
-        const delays = [];
-        for (let i = 0; i < estFrames; i++) delays.push(delayMs);
+      let outW, outH, fps, dur;
 
-        return res.json({
-          format: "video",
-          width: outW,
-          height: outH,
-          srcWidth: probe.srcW,
-          srcHeight: probe.srcH,
-          srcFps: Math.round(probe.srcFps),
-          fps,
-          duration: probe.duration,
-          frameCount: estFrames,
-          delays,
-          totalSegments,
-          segmentDuration: SEGMENT_DURATION,
-        });
-      }
-
-      // ── Segment mode ──
-      const si = parseInt(segment);
-      let outW, outH, fps, totalDuration;
-
-      // Fast path: dimensions passed as query params, skip probe
+      // Skip probe if dimensions passed
       if (req.query.ow && req.query.oh && req.query.ofps && req.query.dur) {
         outW = parseInt(req.query.ow);
         outH = parseInt(req.query.oh);
         fps = parseInt(req.query.ofps);
-        totalDuration = parseFloat(req.query.dur);
+        dur = parseFloat(req.query.dur);
       } else {
-        // Slow fallback: probe
-        const probe = probeVideo(inputPath);
-        const calc = calcOutputSize(
-          probe.srcW,
-          probe.srcH,
-          maxres ? parseInt(maxres) : undefined
-        );
-        outW = calc.w;
-        outH = calc.h;
-        fps = maxfps
-          ? Math.min(parseInt(maxfps), Math.round(probe.srcFps))
-          : Math.min(30, Math.round(probe.srcFps));
-        totalDuration = probe.duration;
+        let probe = "";
+        try {
+          probe = execSync(`${ffmpegPath} -i ${inp} 2>&1`, { encoding: "utf8", timeout: 3000 });
+        } catch (e) { probe = (e.stderr || e.stdout || e.message || "").toString(); }
+
+        dur = 10;
+        const dm = probe.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
+        if (dm) dur = +dm[1] * 3600 + +dm[2] * 60 + +dm[3] + +dm[4] / 100;
+
+        const sm = probe.match(/,\s*(\d{2,5})x(\d{2,5})/);
+        let sw = 640, sh = 480;
+        if (sm) { sw = +sm[1]; sh = +sm[2]; }
+
+        let sf = 30;
+        const fm = probe.match(/(\d+(?:\.\d+)?)\s*fps/);
+        if (fm) sf = parseFloat(fm[1]);
+
+        fps = Math.min(MAX_VIDEO_FPS, Math.round(sf));
+        const fit = fitSize(sw, sh, MAX_VIDEO_DIM);
+        outW = fit.w; outH = fit.h;
       }
 
-      const startTime = si * SEGMENT_DURATION;
-      const segDur = Math.min(SEGMENT_DURATION, totalDuration - startTime);
+      // Dynamic segment sizing: guarantee response fits under MAX_RESPONSE
+      const fb = outW * outH * 4;
+      const maxFramesPerSeg = Math.max(1, Math.floor(MAX_RESPONSE / fb));
+      const segSec = Math.min(maxFramesPerSeg / fps, 5);
+      const totalSegments = Math.ceil(dur / segSec);
+
+      // Info mode
+      if (segment === undefined) {
+        const estFrames = Math.ceil(dur * fps);
+        const delayMs = Math.round(1000 / fps);
+        return res.json({
+          format: "video", width: outW, height: outH,
+          fps, duration: dur, frameCount: estFrames,
+          delays: Array(estFrames).fill(delayMs),
+          totalSegments, segSec,
+        });
+      }
+
+      // Segment mode
+      const si = parseInt(segment);
+      const startTime = si * segSec;
+      const segDur = Math.min(segSec, dur - startTime);
 
       if (segDur <= 0) {
         const out = Buffer.alloc(4);
@@ -273,15 +183,13 @@ module.exports = async (req, res) => {
         return res.send(out);
       }
 
-      const rawPath = path.join(tmpDir, "out.raw");
+      const rawPath = path.join(dir, "o.raw");
       execSync(
-        `${ffmpegPath} -y -ss ${startTime.toFixed(3)} -i ${inputPath} -t ${segDur.toFixed(3)} ` +
-          `-vf "scale=${outW}:${outH},fps=${fps}" ` +
-          `-pix_fmt rgba -f rawvideo ${rawPath}`,
+        `${ffmpegPath} -y -ss ${startTime.toFixed(3)} -i ${inp} -t ${segDur.toFixed(3)} ` +
+          `-vf "scale=${outW}:${outH},fps=${fps}" -pix_fmt rgba -f rawvideo ${rawPath}`,
         { timeout: 8000 }
       );
 
-      const frameBytes = outW * outH * 4;
       if (!fs.existsSync(rawPath)) {
         const out = Buffer.alloc(4);
         out.writeUInt32LE(0, 0);
@@ -289,26 +197,20 @@ module.exports = async (req, res) => {
         return res.send(out);
       }
 
-      const rawData = fs.readFileSync(rawPath);
-      const count = Math.floor(rawData.length / frameBytes);
-
-      const out = Buffer.alloc(4 + frameBytes * count);
+      const raw = fs.readFileSync(rawPath);
+      const count = Math.floor(raw.length / fb);
+      const out = Buffer.alloc(4 + fb * count);
       out.writeUInt32LE(count, 0);
-      let offset = 4;
-      for (let i = 0; i < count; i++) {
-        rawData.copy(out, offset, i * frameBytes, (i + 1) * frameBytes);
-        offset += frameBytes;
-      }
+      let off = 4;
+      for (let i = 0; i < count; i++) { raw.copy(out, off, i * fb, (i + 1) * fb); off += fb; }
 
       res.setHeader("Content-Type", "application/octet-stream");
       return res.send(out);
     } finally {
-      try {
-        fs.rmSync(tmpDir, { recursive: true, force: true });
-      } catch {}
+      try { fs.rmSync(dir, { recursive: true, force: true }); } catch {}
     }
   } catch (e) {
-    console.error("frames error:", e.message);
+    console.error("frames:", e.message);
     return res.status(500).json({ error: e.message });
   }
 };

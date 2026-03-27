@@ -11,7 +11,7 @@ try {
 }
 
 const MAX_RES = 256;
-const MAX_FPS = 10;
+const MAX_FPS = 20;
 const MAX_DURATION = 30; // seconds
 const DEFAULT_DELAY = 100; // ms
 

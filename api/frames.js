@@ -6,12 +6,12 @@ const path = require("path");
 let ffmpegPath;
 try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
 
-const MAX_VIDEO_DIM = 256;
-const MAX_VIDEO_FPS = 30;
+const MAX_VIDEO_DIM = 480;
+const MAX_VIDEO_FPS = 24;
 const MAX_GIF_DIM = 512;
-const MAX_RESPONSE = 4000000;
+const MAX_RESPONSE = 4500000;
 const DEFAULT_DELAY = 100;
-const SEGMENT_SECONDS = 10; // bigger segments = fewer requests
+const SEGMENT_SECONDS = 12;
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
@@ -22,14 +22,42 @@ function fitSize(srcW, srcH, maxDim) {
   let w = srcW, h = srcH;
   if (w > maxDim || h > maxDim) {
     const s = Math.min(maxDim / w, maxDim / h);
-    w = Math.round(w * s); h = Math.round(h * s);
+    w = Math.round(w * s);
+    h = Math.round(h * s);
   }
   return { w: clampEven(Math.max(2, w)), h: clampEven(Math.max(2, h)) };
 }
 
 function makeTmp() {
   const d = path.join("/tmp", "f" + Date.now() + Math.random().toString(36).slice(2));
-  fs.mkdirSync(d, { recursive: true }); return d;
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+// Smart quality: pick resolution + fps to balance quality vs segment count
+function pickQuality(srcW, srcH, srcFps, duration) {
+  const maxDim = MAX_VIDEO_DIM;
+  let fps = Math.min(MAX_VIDEO_FPS, Math.round(srcFps));
+  const fit = fitSize(srcW, srcH, maxDim);
+  let w = fit.w, h = fit.h;
+  const fb = w * h * 4;
+
+  // If frame is huge and video is long, drop fps to keep segments reasonable
+  const framesPerSeg = Math.max(1, Math.floor(MAX_RESPONSE / fb));
+  const segSec = Math.min(framesPerSeg / fps, SEGMENT_SECONDS);
+  let totalSegs = Math.ceil(duration / segSec);
+
+  // If too many segments (>30), reduce fps first, then resolution
+  if (totalSegs > 40 && fps > 12) {
+    fps = 12;
+    const segSec2 = Math.min(framesPerSeg / fps, SEGMENT_SECONDS);
+    totalSegs = Math.ceil(duration / segSec2);
+  }
+  if (totalSegs > 60 && fps > 8) {
+    fps = 8;
+  }
+
+  return { w, h, fps };
 }
 
 async function processGif(buf) {
@@ -42,7 +70,9 @@ async function processGif(buf) {
   let { w, h } = fitSize(meta.width, pageH, MAX_GIF_DIM);
   let fb = w * h * 4;
   while (fb * pages > 400 * 1024 * 1024 && w > 64) {
-    w = clampEven(Math.round(w * 0.7)); h = clampEven(Math.round(h * 0.7)); fb = w * h * 4;
+    w = clampEven(Math.round(w * 0.7));
+    h = clampEven(Math.round(h * 0.7));
+    fb = w * h * 4;
   }
 
   const { data, info } = await sharp(buf, { pages: -1 })
@@ -56,38 +86,49 @@ async function processGif(buf) {
   for (let i = 0; i < pages; i++) {
     const off = i * fb;
     if (off + fb > data.length) break;
-    const f = Buffer.alloc(fb); data.copy(f, 0, off, off + fb);
-    frames.push(f); finalDelays.push(delays[i]);
+    const f = Buffer.alloc(fb);
+    data.copy(f, 0, off, off + fb);
+    frames.push(f);
+    finalDelays.push(delays[i]);
   }
 
   const fpb = Math.max(1, Math.floor(MAX_RESPONSE / fb));
-  return { width: frameW, height: frameH, frameCount: frames.length,
+  return {
+    width: frameW, height: frameH, frameCount: frames.length,
     delays: finalDelays, frames, framesPerBatch: fpb,
-    totalBatches: Math.ceil(frames.length / fpb) };
+    totalBatches: Math.ceil(frames.length / fpb),
+  };
 }
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
   const { url, segment } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
   try {
     const resp = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(8000),
     });
     if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
     const buf = Buffer.from(await resp.arrayBuffer());
 
     let isAnim = false;
-    try { const m = await sharp(buf).metadata(); if (m.pages > 1) isAnim = true; } catch {}
+    try {
+      const m = await sharp(buf).metadata();
+      if (m.pages > 1) isAnim = true;
+    } catch {}
 
     if (isAnim) {
       const gif = await processGif(buf);
       const fb = gif.width * gif.height * 4;
       if (segment === undefined) {
-        return res.json({ format: "gif", width: gif.width, height: gif.height,
-          frameCount: gif.frameCount, delays: gif.delays, totalSegments: gif.totalBatches });
+        return res.json({
+          format: "gif", width: gif.width, height: gif.height,
+          frameCount: gif.frameCount, delays: gif.delays,
+          totalSegments: gif.totalBatches,
+        });
       }
       const si = parseInt(segment);
       const start = si * gif.framesPerBatch;
@@ -96,7 +137,10 @@ module.exports = async (req, res) => {
       const out = Buffer.alloc(4 + fb * count);
       out.writeUInt32LE(count, 0);
       let off = 4;
-      for (let i = start; i < end2; i++) { gif.frames[i].copy(out, off, 0, fb); off += fb; }
+      for (let i = start; i < end2; i++) {
+        gif.frames[i].copy(out, off, 0, fb);
+        off += fb;
+      }
       res.setHeader("Content-Type", "application/octet-stream");
       return res.send(out);
     }
@@ -110,12 +154,17 @@ module.exports = async (req, res) => {
       let outW, outH, fps, dur;
 
       if (req.query.ow && req.query.oh && req.query.ofps && req.query.dur) {
-        outW = parseInt(req.query.ow); outH = parseInt(req.query.oh);
-        fps = parseInt(req.query.ofps); dur = parseFloat(req.query.dur);
+        outW = parseInt(req.query.ow);
+        outH = parseInt(req.query.oh);
+        fps = parseInt(req.query.ofps);
+        dur = parseFloat(req.query.dur);
       } else {
         let probe = "";
-        try { probe = execSync(`${ffmpegPath} -i ${inp} 2>&1`, { encoding: "utf8", timeout: 3000 });
-        } catch (e) { probe = (e.stderr || e.stdout || e.message || "").toString(); }
+        try {
+          probe = execSync(`${ffmpegPath} -i ${inp} 2>&1`, { encoding: "utf8", timeout: 4000 });
+        } catch (e) {
+          probe = (e.stderr || e.stdout || e.message || "").toString();
+        }
 
         dur = 10;
         const dm = probe.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
@@ -129,9 +178,8 @@ module.exports = async (req, res) => {
         const fm = probe.match(/(\d+(?:\.\d+)?)\s*fps/);
         if (fm) sf = parseFloat(fm[1]);
 
-        fps = Math.min(MAX_VIDEO_FPS, Math.round(sf));
-        const fit = fitSize(sw, sh, MAX_VIDEO_DIM);
-        outW = fit.w; outH = fit.h;
+        const q = pickQuality(sw, sh, sf, dur);
+        outW = q.w; outH = q.h; fps = q.fps;
       }
 
       const fb = outW * outH * 4;
@@ -142,9 +190,12 @@ module.exports = async (req, res) => {
       if (segment === undefined) {
         const estFrames = Math.ceil(dur * fps);
         const delayMs = Math.round(1000 / fps);
-        return res.json({ format: "video", width: outW, height: outH,
+        return res.json({
+          format: "video", width: outW, height: outH,
           fps, duration: dur, frameCount: estFrames,
-          delays: Array(estFrames).fill(delayMs), totalSegments, segSec });
+          delays: Array(estFrames).fill(delayMs),
+          totalSegments, segSec,
+        });
       }
 
       const si = parseInt(segment);
@@ -152,7 +203,8 @@ module.exports = async (req, res) => {
       const segDur = Math.min(segSec, dur - startTime);
 
       if (segDur <= 0) {
-        const out = Buffer.alloc(4); out.writeUInt32LE(0, 0);
+        const out = Buffer.alloc(4);
+        out.writeUInt32LE(0, 0);
         res.setHeader("Content-Type", "application/octet-stream");
         return res.send(out);
       }
@@ -160,12 +212,13 @@ module.exports = async (req, res) => {
       const rawPath = path.join(dir, "o.raw");
       execSync(
         `${ffmpegPath} -y -ss ${startTime.toFixed(3)} -i ${inp} -t ${segDur.toFixed(3)} ` +
-          `-vf "scale=${outW}:${outH},fps=${fps}" -pix_fmt rgba -f rawvideo ${rawPath}`,
-        { timeout: 9000 }
+          `-vf "scale=${outW}:${outH}:flags=lanczos,fps=${fps}" -pix_fmt rgba -f rawvideo ${rawPath}`,
+        { timeout: 15000 }
       );
 
       if (!fs.existsSync(rawPath)) {
-        const out = Buffer.alloc(4); out.writeUInt32LE(0, 0);
+        const out = Buffer.alloc(4);
+        out.writeUInt32LE(0, 0);
         res.setHeader("Content-Type", "application/octet-stream");
         return res.send(out);
       }
@@ -175,7 +228,10 @@ module.exports = async (req, res) => {
       const out = Buffer.alloc(4 + fb * count);
       out.writeUInt32LE(count, 0);
       let off = 4;
-      for (let i = 0; i < count; i++) { raw.copy(out, off, i * fb, (i + 1) * fb); off += fb; }
+      for (let i = 0; i < count; i++) {
+        raw.copy(out, off, i * fb, (i + 1) * fb);
+        off += fb;
+      }
 
       res.setHeader("Content-Type", "application/octet-stream");
       return res.send(out);

@@ -1,8 +1,8 @@
 const sharp = require("sharp");
 
-const TILE = 1024; // EditableImage max — use the biggest tile possible
-const MAX_DIM = 8192; // allow bigger images, we'll downscale
-const TARGET_MAX = 4096; // downscale to this if larger
+const TILE = 1024;
+const MAX_DIM = 8192;
+const TARGET_MAX = 4096;
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -22,9 +22,8 @@ module.exports = async (req, res) => {
     let meta = await sharp(buf).metadata();
     if (!meta.width || !meta.height) throw new Error("Not an image");
     if (meta.width > MAX_DIM || meta.height > MAX_DIM)
-      throw new Error(`Too large: ${meta.width}x${meta.height}`);
+      throw new Error(`Too large: ${meta.width}x${meta.height}, max ${MAX_DIM}`);
 
-    // Downscale if needed, preserving aspect ratio
     let pipeline = sharp(buf).ensureAlpha();
     if (meta.width > TARGET_MAX || meta.height > TARGET_MAX) {
       pipeline = pipeline.resize(TARGET_MAX, TARGET_MAX, {
@@ -43,8 +42,6 @@ module.exports = async (req, res) => {
     const tilesY = Math.ceil(fullH / TILE);
 
     // Calculate total binary size
-    // Header: 20 bytes
-    // Per tile: 8 bytes header + w*h*4 bytes pixel data
     let totalSize = 20;
     for (let ty = 0; ty < tilesY; ty++) {
       for (let tx = 0; tx < tilesX; tx++) {
@@ -54,20 +51,6 @@ module.exports = async (req, res) => {
       }
     }
 
-    // Check Vercel response limit (~4.5MB)
-    if (totalSize > 4500000) {
-      // Fall back: return just the info so the client can request individual tiles
-      return res.json({
-        mode: "chunked",
-        width: fullW,
-        height: fullH,
-        tileSize: TILE,
-        tilesX,
-        tilesY,
-      });
-    }
-
-    // Single binary response with everything
     const out = Buffer.alloc(totalSize);
     let offset = 0;
 

@@ -10,16 +10,25 @@ try {
   ffmpegPath = null;
 }
 
-const MAX_RAW_PER_REQUEST = 4000000; // 4MB response limit
+const MAX_RAW_PER_REQUEST = 4000000;
 const DEFAULT_DELAY = 100;
-const SEGMENT_DURATION = 3; // seconds per segment — safe for 10s timeout
+const SEGMENT_DURATION = 3;
+const MAX_FRAME_DIM = 1024; // EditableImage limit
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
   return n % 2 === 1 ? n + 1 : n;
 }
 
-// ── GIF: self-contained, no caching needed ──
+function fitSize(srcW, srcH, maxDim) {
+  let w = srcW, h = srcH;
+  if (w > maxDim || h > maxDim) {
+    const scale = Math.min(maxDim / w, maxDim / h);
+    w = Math.round(w * scale);
+    h = Math.round(h * scale);
+  }
+  return { w: clampEven(Math.max(2, w)), h: clampEven(Math.max(2, h)) };
+}
 
 async function processGif(buf, userMaxRes) {
   const meta = await sharp(buf, { pages: -1 }).metadata();
@@ -35,23 +44,16 @@ async function processGif(buf, userMaxRes) {
     );
   }
 
-  let resizeW = meta.width;
-  let resizeH = pageHeight;
-  if (userMaxRes && (resizeW > userMaxRes || resizeH > userMaxRes)) {
-    const scale = Math.min(userMaxRes / resizeW, userMaxRes / resizeH);
-    resizeW = Math.round(resizeW * scale);
-    resizeH = Math.round(resizeH * scale);
-  }
+  const maxRes = Math.min(userMaxRes || MAX_FRAME_DIM, MAX_FRAME_DIM);
+  let { w: resizeW, h: resizeH } = fitSize(meta.width, pageHeight, maxRes);
 
   // Memory guard
   let frameBytes = resizeW * resizeH * 4;
   while (frameBytes * pages > 500 * 1024 * 1024 && (resizeW > 64 || resizeH > 64)) {
-    resizeW = Math.round(resizeW * 0.7);
-    resizeH = Math.round(resizeH * 0.7);
+    resizeW = clampEven(Math.round(resizeW * 0.7));
+    resizeH = clampEven(Math.round(resizeH * 0.7));
     frameBytes = resizeW * resizeH * 4;
   }
-  resizeW = Math.max(2, resizeW);
-  resizeH = Math.max(2, resizeH);
 
   const { data: rawAll, info } = await sharp(buf, { pages: -1 })
     .resize(resizeW, resizeH, { fit: "fill" })
@@ -85,8 +87,6 @@ async function processGif(buf, userMaxRes) {
     frames,
   };
 }
-
-// ── Video: probe only ──
 
 function probeVideo(buf) {
   if (!ffmpegPath) throw new Error("ffmpeg not available");
@@ -134,7 +134,16 @@ function probeVideo(buf) {
   }
 }
 
-// ── Video: extract one time segment ──
+function calcOutputSize(srcW, srcH, userMaxRes) {
+  const maxRes = Math.min(userMaxRes || MAX_FRAME_DIM, MAX_FRAME_DIM);
+  let { w, h } = fitSize(srcW, srcH, maxRes);
+  // Extra memory guard: max ~4MB per frame
+  while (w * h * 4 > 4 * 1024 * 1024) {
+    w = clampEven(Math.round(w * 0.8));
+    h = clampEven(Math.round(h * 0.8));
+  }
+  return { w, h };
+}
 
 function extractSegment(buf, startTime, segDuration, outW, outH, fps) {
   const tmpDir = path.join("/tmp", "seg_" + Date.now() + "_" + Math.random().toString(36).slice(2));
@@ -180,7 +189,6 @@ module.exports = async (req, res) => {
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
   try {
-    // Download source
     const resp = await fetch(url, {
       headers: { "User-Agent": "Mozilla/5.0" },
       signal: AbortSignal.timeout(5000),
@@ -189,21 +197,19 @@ module.exports = async (req, res) => {
 
     const buf = Buffer.from(await resp.arrayBuffer());
 
-    // Check if animated image
     let isAnimated = false;
     try {
       const meta = await sharp(buf).metadata();
       if (meta.pages && meta.pages > 1) isAnimated = true;
     } catch {}
 
-    // ── GIF: return everything at once ──
+    // ── GIF ──
     if (isAnimated) {
       const result = await processGif(buf, maxres ? parseInt(maxres) : undefined);
       const frameBytes = result.width * result.height * 4;
       const framesPerBatch = Math.max(1, Math.floor(MAX_RAW_PER_REQUEST / frameBytes));
       const totalBatches = Math.ceil(result.frameCount / framesPerBatch);
 
-      // If requesting a specific batch
       if (segment !== undefined) {
         const si = parseInt(segment);
         const start = si * framesPerBatch;
@@ -221,7 +227,6 @@ module.exports = async (req, res) => {
         return res.send(out);
       }
 
-      // Info response
       return res.json({
         format: "gif",
         width: result.width,
@@ -236,32 +241,18 @@ module.exports = async (req, res) => {
     }
 
     // ── Video ──
+    const probe = probeVideo(buf);
+    const { w: outW, h: outH } = calcOutputSize(
+      probe.srcW, probe.srcH,
+      maxres ? parseInt(maxres) : undefined
+    );
+    const fps = maxfps
+      ? Math.min(parseInt(maxfps), Math.round(probe.srcFps))
+      : Math.min(30, Math.round(probe.srcFps));
 
-    // Info mode
     if (segment === undefined) {
-      const probe = probeVideo(buf);
-
-      let outW = probe.srcW;
-      let outH = probe.srcH;
-      const userMaxRes = maxres ? parseInt(maxres) : undefined;
-      if (userMaxRes && (outW > userMaxRes || outH > userMaxRes)) {
-        const scale = Math.min(userMaxRes / outW, userMaxRes / outH);
-        outW = Math.round(outW * scale);
-        outH = Math.round(outH * scale);
-      }
-      // Memory guard: max ~4MB per frame
-      while (outW * outH * 4 > 4 * 1024 * 1024) {
-        outW = Math.round(outW * 0.8);
-        outH = Math.round(outH * 0.8);
-      }
-      outW = clampEven(outW);
-      outH = clampEven(outH);
-
-      const fps = maxfps ? Math.min(parseInt(maxfps), probe.srcFps) : Math.min(30, probe.srcFps);
       const totalSegments = Math.ceil(probe.duration / SEGMENT_DURATION);
       const estFrames = Math.ceil(probe.duration * fps);
-
-      // Build delays array
       const delayMs = Math.round(1000 / fps);
       const delays = [];
       for (let i = 0; i < estFrames; i++) delays.push(delayMs);
@@ -282,31 +273,11 @@ module.exports = async (req, res) => {
       });
     }
 
-    // Segment mode — extract just this time range
     const si = parseInt(segment);
-    const probe = probeVideo(buf);
-
-    let outW = probe.srcW;
-    let outH = probe.srcH;
-    const userMaxRes = maxres ? parseInt(maxres) : undefined;
-    if (userMaxRes && (outW > userMaxRes || outH > userMaxRes)) {
-      const scale = Math.min(userMaxRes / outW, userMaxRes / outH);
-      outW = Math.round(outW * scale);
-      outH = Math.round(outH * scale);
-    }
-    while (outW * outH * 4 > 4 * 1024 * 1024) {
-      outW = Math.round(outW * 0.8);
-      outH = Math.round(outH * 0.8);
-    }
-    outW = clampEven(outW);
-    outH = clampEven(outH);
-
-    const fps = maxfps ? Math.min(parseInt(maxfps), probe.srcFps) : Math.min(30, probe.srcFps);
     const startTime = si * SEGMENT_DURATION;
     const segDur = Math.min(SEGMENT_DURATION, probe.duration - startTime);
 
     if (segDur <= 0) {
-      // Empty segment
       const out = Buffer.alloc(4);
       out.writeUInt32LE(0, 0);
       res.setHeader("Content-Type", "application/octet-stream");

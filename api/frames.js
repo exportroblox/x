@@ -10,69 +10,18 @@ try {
   ffmpegPath = null;
 }
 
-// Hard limits (Vercel constraints)
-const VERCEL_TIMEOUT = 9;       // seconds, leave 1s headroom
-const VERCEL_MEMORY = 1024;     // MB
-const MAX_RAW_BYTES = 800 * 1024 * 1024; // 800MB raw frame budget
-const BATCH_TARGET = 500000;    // 500KB per batch response
+const MAX_RAW_PER_REQUEST = 4000000; // 4MB response limit
 const DEFAULT_DELAY = 100;
-
-const cache = new Map();
-const CACHE_TTL = 180000;
-
-function cleanCache() {
-  const now = Date.now();
-  for (const [key, entry] of cache) {
-    if (now - entry.time > CACHE_TTL) cache.delete(key);
-  }
-}
+const SEGMENT_DURATION = 3; // seconds per segment — safe for 10s timeout
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
   return n % 2 === 1 ? n + 1 : n;
 }
 
-// Calculate the best resolution and fps that fits in memory and time
-function calcSettings(srcW, srcH, srcFps, duration, userMaxRes, userMaxFps) {
-  let fps = Math.min(srcFps || 30, userMaxFps || 30);
-  let totalFrames = Math.ceil(duration * fps);
+// ── GIF: self-contained, no caching needed ──
 
-  let outW = srcW;
-  let outH = srcH;
-
-  // Scale down if user requested max res
-  if (userMaxRes && (outW > userMaxRes || outH > userMaxRes)) {
-    const scale = Math.min(userMaxRes / outW, userMaxRes / outH);
-    outW = Math.round(outW * scale);
-    outH = Math.round(outH * scale);
-  }
-
-  // Check if total raw bytes fit in memory
-  let frameBytes = outW * outH * 4;
-  let totalBytes = frameBytes * totalFrames;
-
-  // If too much, reduce resolution first
-  while (totalBytes > MAX_RAW_BYTES && (outW > 64 || outH > 64)) {
-    outW = Math.round(outW * 0.8);
-    outH = Math.round(outH * 0.8);
-    frameBytes = outW * outH * 4;
-    totalBytes = frameBytes * totalFrames;
-  }
-
-  // If still too much, reduce fps
-  while (totalBytes > MAX_RAW_BYTES && fps > 5) {
-    fps = Math.max(5, fps - 5);
-    totalFrames = Math.ceil(duration * fps);
-    totalBytes = frameBytes * totalFrames;
-  }
-
-  outW = clampEven(outW);
-  outH = clampEven(outH);
-
-  return { outW, outH, fps, totalFrames };
-}
-
-async function processGif(buf, userMaxRes, userMaxFps) {
+async function processGif(buf, userMaxRes) {
   const meta = await sharp(buf, { pages: -1 }).metadata();
   const pages = meta.pages || 1;
   const pageHeight = meta.pageHeight || meta.height;
@@ -88,21 +37,19 @@ async function processGif(buf, userMaxRes, userMaxFps) {
 
   let resizeW = meta.width;
   let resizeH = pageHeight;
-
   if (userMaxRes && (resizeW > userMaxRes || resizeH > userMaxRes)) {
     const scale = Math.min(userMaxRes / resizeW, userMaxRes / resizeH);
     resizeW = Math.round(resizeW * scale);
     resizeH = Math.round(resizeH * scale);
   }
 
-  // Check memory
+  // Memory guard
   let frameBytes = resizeW * resizeH * 4;
-  while (frameBytes * pages > MAX_RAW_BYTES && (resizeW > 64 || resizeH > 64)) {
-    resizeW = Math.round(resizeW * 0.8);
-    resizeH = Math.round(resizeH * 0.8);
+  while (frameBytes * pages > 500 * 1024 * 1024 && (resizeW > 64 || resizeH > 64)) {
+    resizeW = Math.round(resizeW * 0.7);
+    resizeH = Math.round(resizeH * 0.7);
     frameBytes = resizeW * resizeH * 4;
   }
-
   resizeW = Math.max(2, resizeW);
   resizeH = Math.max(2, resizeH);
 
@@ -113,56 +60,43 @@ async function processGif(buf, userMaxRes, userMaxFps) {
     .toBuffer({ resolveWithObject: true });
 
   const frameW = info.width;
-  const totalH = info.height;
-  const frameH = Math.round(totalH / pages);
+  const frameH = Math.round(info.height / pages);
   frameBytes = frameW * frameH * 4;
-
-  // Subsample by fps if requested
-  let step = 1;
-  if (userMaxFps && delays.length > 0) {
-    const avgDelay = delays.reduce((a, b) => a + b, 0) / delays.length;
-    const srcFps = 1000 / Math.max(10, avgDelay);
-    if (userMaxFps < srcFps) {
-      step = Math.max(1, Math.round(srcFps / userMaxFps));
-    }
-  }
 
   const frames = [];
   const finalDelays = [];
-  for (let i = 0; i < pages; i += step) {
+  for (let i = 0; i < pages; i++) {
     const offset = i * frameBytes;
     if (offset + frameBytes > rawAll.length) break;
     const frameBuf = Buffer.alloc(frameBytes);
     rawAll.copy(frameBuf, 0, offset, offset + frameBytes);
     frames.push(frameBuf);
-    finalDelays.push(delays[i] * step);
+    finalDelays.push(delays[i]);
   }
 
   return {
+    type: "gif_complete",
     width: frameW,
     height: frameH,
     srcWidth: meta.width,
     srcHeight: pageHeight,
-    srcFps: Math.round(1000 / (delays[0] || 100)),
     frameCount: frames.length,
     delays: finalDelays,
     frames,
   };
 }
 
-function processVideo(buf, userMaxRes, userMaxFps) {
-  if (!ffmpegPath) throw new Error("ffmpeg not available — install ffmpeg-static");
+// ── Video: probe only ──
 
-  const tmpDir = path.join(
-    "/tmp",
-    "vid_" + Date.now() + "_" + Math.random().toString(36).slice(2)
-  );
+function probeVideo(buf) {
+  if (!ffmpegPath) throw new Error("ffmpeg not available");
+
+  const tmpDir = path.join("/tmp", "probe_" + Date.now() + "_" + Math.random().toString(36).slice(2));
   fs.mkdirSync(tmpDir, { recursive: true });
   const inputPath = path.join(tmpDir, "input");
   fs.writeFileSync(inputPath, buf);
 
   try {
-    // Probe
     let probeOut = "";
     try {
       probeOut = execSync(`${ffmpegPath} -i ${inputPath} 2>&1`, {
@@ -173,8 +107,7 @@ function processVideo(buf, userMaxRes, userMaxFps) {
       probeOut = (e.stderr || e.stdout || e.message || "").toString();
     }
 
-    // Duration
-    let duration = 30;
+    let duration = 10;
     const durMatch = probeOut.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
     if (durMatch) {
       duration =
@@ -184,7 +117,6 @@ function processVideo(buf, userMaxRes, userMaxFps) {
         parseInt(durMatch[4]) / 100;
     }
 
-    // Source dimensions
     const dimMatch = probeOut.match(/,\s*(\d{2,5})x(\d{2,5})/);
     let srcW = 640, srcH = 480;
     if (dimMatch) {
@@ -192,151 +124,203 @@ function processVideo(buf, userMaxRes, userMaxFps) {
       srcH = parseInt(dimMatch[2]);
     }
 
-    // Source FPS
     let srcFps = 30;
     const fpsMatch = probeOut.match(/(\d+(?:\.\d+)?)\s*fps/);
-    if (fpsMatch) {
-      srcFps = parseFloat(fpsMatch[1]);
-    }
+    if (fpsMatch) srcFps = parseFloat(fpsMatch[1]);
 
-    // Calculate optimal settings
-    const settings = calcSettings(
-      srcW, srcH, srcFps, duration,
-      userMaxRes || srcW,  // if no max, use source
-      userMaxFps || srcFps // if no max, use source
-    );
+    return { duration, srcW, srcH, srcFps };
+  } finally {
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
+  }
+}
 
-    const { outW, outH, fps, totalFrames } = settings;
-    const rawPath = path.join(tmpDir, "out.raw");
+// ── Video: extract one time segment ──
 
-    // Calculate timeout: give ffmpeg proportional time but cap it
-    const ffmpegTimeout = Math.min(
-      Math.max(Math.ceil(duration * 1.5), 5) * 1000,
-      VERCEL_TIMEOUT * 1000
-    );
+function extractSegment(buf, startTime, segDuration, outW, outH, fps) {
+  const tmpDir = path.join("/tmp", "seg_" + Date.now() + "_" + Math.random().toString(36).slice(2));
+  fs.mkdirSync(tmpDir, { recursive: true });
+  const inputPath = path.join(tmpDir, "input");
+  const rawPath = path.join(tmpDir, "out.raw");
+  fs.writeFileSync(inputPath, buf);
 
+  try {
     execSync(
-      `${ffmpegPath} -y -i ${inputPath} -t ${duration} ` +
+      `${ffmpegPath} -y -ss ${startTime.toFixed(3)} -i ${inputPath} -t ${segDuration.toFixed(3)} ` +
         `-vf "scale=${outW}:${outH},fps=${fps}" ` +
         `-pix_fmt rgba -f rawvideo ${rawPath}`,
-      { timeout: ffmpegTimeout }
+      { timeout: 8000 }
     );
 
-    if (!fs.existsSync(rawPath)) throw new Error("ffmpeg produced no output");
+    if (!fs.existsSync(rawPath)) return [];
+
     const rawData = fs.readFileSync(rawPath);
     const frameBytes = outW * outH * 4;
-    const actualFrames = Math.floor(rawData.length / frameBytes);
+    const count = Math.floor(rawData.length / frameBytes);
 
-    if (actualFrames === 0) throw new Error("No frames extracted");
-
-    const delayMs = Math.round(1000 / fps);
     const frames = [];
-    const delays = [];
-    for (let i = 0; i < actualFrames; i++) {
+    for (let i = 0; i < count; i++) {
       const offset = i * frameBytes;
       const frameBuf = Buffer.alloc(frameBytes);
       rawData.copy(frameBuf, 0, offset, offset + frameBytes);
       frames.push(frameBuf);
-      delays.push(delayMs);
     }
-
-    return {
-      width: outW,
-      height: outH,
-      srcWidth: srcW,
-      srcHeight: srcH,
-      srcFps: Math.round(srcFps),
-      frameCount: actualFrames,
-      delays,
-      frames,
-    };
+    return frames;
+  } catch (e) {
+    console.error("segment extract error:", e.message);
+    return [];
   } finally {
-    try {
-      fs.rmSync(tmpDir, { recursive: true, force: true });
-    } catch {}
+    try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch {}
   }
 }
 
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
 
-  const { url, batch, maxres, maxfps } = req.query;
+  const { url, segment, maxres, maxfps } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
-  const userMaxRes = maxres ? parseInt(maxres) : undefined;
-  const userMaxFps = maxfps ? parseInt(maxfps) : undefined;
-
-  // Cache key includes quality settings
-  const cacheKey = `${url}|${userMaxRes || "auto"}|${userMaxFps || "auto"}`;
-
   try {
-    cleanCache();
-    let cached = cache.get(cacheKey);
+    // Download source
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Mozilla/5.0" },
+      signal: AbortSignal.timeout(5000),
+    });
+    if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
 
-    if (!cached) {
-      const resp = await fetch(url, {
-        headers: { "User-Agent": "Mozilla/5.0" },
-        signal: AbortSignal.timeout(4000),
-      });
-      if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
+    const buf = Buffer.from(await resp.arrayBuffer());
 
-      const buf = Buffer.from(await resp.arrayBuffer());
+    // Check if animated image
+    let isAnimated = false;
+    try {
+      const meta = await sharp(buf).metadata();
+      if (meta.pages && meta.pages > 1) isAnimated = true;
+    } catch {}
 
-      let isAnimated = false;
-      try {
-        const meta = await sharp(buf).metadata();
-        if (meta.pages && meta.pages > 1) isAnimated = true;
-      } catch {}
+    // ── GIF: return everything at once ──
+    if (isAnimated) {
+      const result = await processGif(buf, maxres ? parseInt(maxres) : undefined);
+      const frameBytes = result.width * result.height * 4;
+      const framesPerBatch = Math.max(1, Math.floor(MAX_RAW_PER_REQUEST / frameBytes));
+      const totalBatches = Math.ceil(result.frameCount / framesPerBatch);
 
-      let result;
-      if (isAnimated) {
-        result = await processGif(buf, userMaxRes, userMaxFps);
-      } else {
-        result = processVideo(buf, userMaxRes, userMaxFps);
+      // If requesting a specific batch
+      if (segment !== undefined) {
+        const si = parseInt(segment);
+        const start = si * framesPerBatch;
+        const end = Math.min(start + framesPerBatch, result.frameCount);
+        const count = end - start;
+
+        const out = Buffer.alloc(4 + frameBytes * count);
+        out.writeUInt32LE(count, 0);
+        let offset = 4;
+        for (let i = start; i < end; i++) {
+          result.frames[i].copy(out, offset, 0, frameBytes);
+          offset += frameBytes;
+        }
+        res.setHeader("Content-Type", "application/octet-stream");
+        return res.send(out);
       }
 
-      const frameBytes = result.width * result.height * 4;
-      const framesPerBatch = Math.max(1, Math.floor(BATCH_TARGET / frameBytes));
-
-      cached = {
-        ...result,
-        framesPerBatch,
-        totalBatches: Math.ceil(result.frameCount / framesPerBatch),
-        time: Date.now(),
-      };
-      cache.set(cacheKey, cached);
-    } else {
-      cached.time = Date.now();
-    }
-
-    if (batch === undefined) {
+      // Info response
       return res.json({
-        width: cached.width,
-        height: cached.height,
-        srcWidth: cached.srcWidth,
-        srcHeight: cached.srcHeight,
-        srcFps: cached.srcFps,
-        frameCount: cached.frameCount,
-        delays: cached.delays,
-        framesPerBatch: cached.framesPerBatch,
-        totalBatches: cached.totalBatches,
+        format: "gif",
+        width: result.width,
+        height: result.height,
+        srcWidth: result.srcWidth,
+        srcHeight: result.srcHeight,
+        srcFps: 0,
+        frameCount: result.frameCount,
+        delays: result.delays,
+        totalSegments: totalBatches,
       });
     }
 
-    const bi = parseInt(batch);
-    if (isNaN(bi) || bi < 0 || bi >= cached.totalBatches)
-      throw new Error("Batch out of range");
+    // ── Video ──
 
-    const start = bi * cached.framesPerBatch;
-    const end = Math.min(start + cached.framesPerBatch, cached.frameCount);
-    const count = end - start;
-    const frameBytes = cached.width * cached.height * 4;
+    // Info mode
+    if (segment === undefined) {
+      const probe = probeVideo(buf);
 
-    const out = Buffer.alloc(4 + frameBytes * count);
-    out.writeUInt32LE(count, 0);
+      let outW = probe.srcW;
+      let outH = probe.srcH;
+      const userMaxRes = maxres ? parseInt(maxres) : undefined;
+      if (userMaxRes && (outW > userMaxRes || outH > userMaxRes)) {
+        const scale = Math.min(userMaxRes / outW, userMaxRes / outH);
+        outW = Math.round(outW * scale);
+        outH = Math.round(outH * scale);
+      }
+      // Memory guard: max ~4MB per frame
+      while (outW * outH * 4 > 4 * 1024 * 1024) {
+        outW = Math.round(outW * 0.8);
+        outH = Math.round(outH * 0.8);
+      }
+      outW = clampEven(outW);
+      outH = clampEven(outH);
+
+      const fps = maxfps ? Math.min(parseInt(maxfps), probe.srcFps) : Math.min(30, probe.srcFps);
+      const totalSegments = Math.ceil(probe.duration / SEGMENT_DURATION);
+      const estFrames = Math.ceil(probe.duration * fps);
+
+      // Build delays array
+      const delayMs = Math.round(1000 / fps);
+      const delays = [];
+      for (let i = 0; i < estFrames; i++) delays.push(delayMs);
+
+      return res.json({
+        format: "video",
+        width: outW,
+        height: outH,
+        srcWidth: probe.srcW,
+        srcHeight: probe.srcH,
+        srcFps: Math.round(probe.srcFps),
+        fps,
+        duration: probe.duration,
+        frameCount: estFrames,
+        delays,
+        totalSegments,
+        segmentDuration: SEGMENT_DURATION,
+      });
+    }
+
+    // Segment mode — extract just this time range
+    const si = parseInt(segment);
+    const probe = probeVideo(buf);
+
+    let outW = probe.srcW;
+    let outH = probe.srcH;
+    const userMaxRes = maxres ? parseInt(maxres) : undefined;
+    if (userMaxRes && (outW > userMaxRes || outH > userMaxRes)) {
+      const scale = Math.min(userMaxRes / outW, userMaxRes / outH);
+      outW = Math.round(outW * scale);
+      outH = Math.round(outH * scale);
+    }
+    while (outW * outH * 4 > 4 * 1024 * 1024) {
+      outW = Math.round(outW * 0.8);
+      outH = Math.round(outH * 0.8);
+    }
+    outW = clampEven(outW);
+    outH = clampEven(outH);
+
+    const fps = maxfps ? Math.min(parseInt(maxfps), probe.srcFps) : Math.min(30, probe.srcFps);
+    const startTime = si * SEGMENT_DURATION;
+    const segDur = Math.min(SEGMENT_DURATION, probe.duration - startTime);
+
+    if (segDur <= 0) {
+      // Empty segment
+      const out = Buffer.alloc(4);
+      out.writeUInt32LE(0, 0);
+      res.setHeader("Content-Type", "application/octet-stream");
+      return res.send(out);
+    }
+
+    const frames = extractSegment(buf, startTime, segDur, outW, outH, fps);
+    const frameBytes = outW * outH * 4;
+
+    const out = Buffer.alloc(4 + frameBytes * frames.length);
+    out.writeUInt32LE(frames.length, 0);
     let offset = 4;
-    for (let i = start; i < end; i++) {
-      cached.frames[i].copy(out, offset, 0, frameBytes);
+    for (const frame of frames) {
+      frame.copy(out, offset, 0, frameBytes);
       offset += frameBytes;
     }
 

@@ -7,7 +7,7 @@ let ffmpegPath;
 try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
 
 const MAX_VIDEO_DIM = 320;
-const MAX_VIDEO_FPS = 10;
+const MAX_VIDEO_FPS = 30;
 const MAX_GIF_DIM = 512;
 const MAX_RESPONSE = 3500000; // 3.5MB safety margin under Vercel's 4.5MB limit
 const DEFAULT_DELAY = 100;

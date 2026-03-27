@@ -14,7 +14,7 @@ const MAX_RES = 512;
 const MAX_FPS = 30;
 const MAX_DURATION = 30;
 const DEFAULT_DELAY = 100;
-const MAX_FRAMES = 900;
+const MAX_FRAMES = 50000;
 const BATCH_SIZE_BYTES = 500000; // 500KB per batch = many small fast batches
 
 const cache = new Map();

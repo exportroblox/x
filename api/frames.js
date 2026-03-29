@@ -1,7 +1,8 @@
 const sharp = require("sharp");
-const { execFile } = require("child_process");
+const { execSync } = require("child_process");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 let ffmpegPath;
 try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
@@ -9,13 +10,8 @@ try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
 const MAX_VIDEO_DIM = 480;
 const MAX_VIDEO_FPS = 30;
 const MAX_GIF_DIM = 512;
-const MAX_RESPONSE = 20_000_000; // 20MB segments (was 4.5MB)
+const MAX_RESPONSE = 4500000;
 const DEFAULT_DELAY = 100;
-
-// ─── CACHE ───────────────────────────────────────────────
-// url → { format, width, height, fb, frameCount, delays, framesPerSeg, totalSegments, rawPath?, rawData?, ... }
-const processCache = new Map();
-const processingLocks = new Map(); // url → Promise
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
@@ -31,135 +27,113 @@ function fitSize(srcW, srcH, maxDim) {
   return { w: clampEven(Math.max(2, w)), h: clampEven(Math.max(2, h)) };
 }
 
-function makeTmp(label) {
-  const d = path.join(require("os").tmpdir(), `frm_${label}_${Date.now()}`);
-  fs.mkdirSync(d, { recursive: true });
-  return d;
+function urlHash(url) {
+  return crypto.createHash("md5").update(url).digest("hex");
 }
 
-function runFF(args, timeout = 120000) {
-  return new Promise((resolve, reject) => {
-    execFile(ffmpegPath, args, { timeout, maxBuffer: 50 * 1024 * 1024 }, (err, stdout, stderr) => {
-      resolve({ err, stdout, stderr: stderr || (err && err.stderr ? err.stderr.toString() : "") });
-    });
-  });
+// ─── /tmp cache: survives across requests on same Vercel instance ───
+function getCacheDir(url) {
+  return path.join("/tmp", "vc_" + urlHash(url));
 }
 
-// ─── Download + process ONCE, cache result ───────────────
-async function processUrl(url) {
-  if (processCache.has(url)) return processCache.get(url);
-  if (processingLocks.has(url)) return await processingLocks.get(url);
+function readMeta(cacheDir) {
+  const p = path.join(cacheDir, "meta.json");
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, "utf8")); } catch { return null; }
+}
 
-  const promise = _doProcess(url);
-  processingLocks.set(url, promise);
-  try {
-    const result = await promise;
-    processCache.set(url, result);
-    return result;
-  } catch (e) {
-    throw e;
-  } finally {
-    processingLocks.delete(url);
+function writeMeta(cacheDir, meta) {
+  fs.writeFileSync(path.join(cacheDir, "meta.json"), JSON.stringify(meta));
+}
+
+// Download source once, cache in /tmp
+async function ensureSource(url) {
+  const cacheDir = getCacheDir(url);
+  const srcPath = path.join(cacheDir, "src");
+
+  if (fs.existsSync(srcPath)) {
+    return { cacheDir, srcPath, buf: null };
   }
-}
 
-async function _doProcess(url) {
-  console.time(`process ${url}`);
+  fs.mkdirSync(cacheDir, { recursive: true });
 
   const resp = await fetch(url, {
     headers: { "User-Agent": "Mozilla/5.0" },
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(12000),
   });
   if (!resp.ok) throw new Error(`Source HTTP ${resp.status}`);
   const buf = Buffer.from(await resp.arrayBuffer());
-  console.log(`Downloaded ${(buf.length / 1048576).toFixed(1)}MB from ${url}`);
-
-  // Detect type
-  let meta;
-  try { meta = await sharp(buf).metadata(); } catch { meta = null; }
-
-  if (meta && meta.pages && meta.pages > 1) {
-    const r = await processGif(buf, meta);
-    console.timeEnd(`process ${url}`);
-    return r;
-  }
-
-  if (meta && meta.width && meta.height && (!meta.pages || meta.pages === 1)) {
-    // Static image
-    const r = await processImage(buf, meta);
-    console.timeEnd(`process ${url}`);
-    return r;
-  }
-
-  // Treat as video
-  const r = await processVideo(buf);
-  console.timeEnd(`process ${url}`);
-  return r;
+  fs.writeFileSync(srcPath, buf);
+  return { cacheDir, srcPath, buf };
 }
 
-async function processImage(buf, meta) {
-  const TARGET = 4096;
-  let pipeline = sharp(buf).ensureAlpha();
-  if (meta.width > TARGET || meta.height > TARGET)
-    pipeline = pipeline.resize(TARGET, TARGET, { fit: "inside", withoutEnlargement: true });
-
-  const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
-  const fb = info.width * info.height * 4;
-
-  console.log(`Image: ${info.width}x${info.height}`);
-  return {
-    format: "image",
-    width: info.width,
-    height: info.height,
-    fb,
-    frameCount: 1,
-    delays: [0],
-    framesPerSeg: 1,
-    totalSegments: 1,
-    imageData: data,
-  };
+function getSourceBuf(srcPath, cached) {
+  if (cached) return cached;
+  return fs.readFileSync(srcPath);
 }
 
-async function processGif(buf, meta) {
-  const pages = meta.pages || 1;
-  const pageH = meta.pageHeight || meta.height;
-  const srcDelays = [];
-  for (let i = 0; i < pages; i++) srcDelays.push(meta.delay?.[i] || DEFAULT_DELAY);
+// ─── GIF processing (process all frames once, cache) ───
+async function ensureGifProcessed(url) {
+  const { cacheDir, srcPath, buf: dlBuf } = await ensureSource(url);
+  const meta = readMeta(cacheDir);
+  if (meta && meta.format === "gif") return { cacheDir, meta };
 
-  let { w, h } = fitSize(meta.width, pageH, MAX_GIF_DIM);
+  const buf = getSourceBuf(srcPath, dlBuf);
+  const sharpMeta = await sharp(buf, { pages: -1 }).metadata();
+  const pages = sharpMeta.pages || 1;
+  const pageH = sharpMeta.pageHeight || sharpMeta.height;
+  const delays = [];
+  for (let i = 0; i < pages; i++) delays.push(sharpMeta.delay?.[i] || DEFAULT_DELAY);
+
+  let { w, h } = fitSize(sharpMeta.width, pageH, MAX_GIF_DIM);
   let fb = w * h * 4;
   while (fb * pages > 400 * 1024 * 1024 && w > 64) {
-    w = clampEven(Math.round(w * 0.7)); h = clampEven(Math.round(h * 0.7)); fb = w * h * 4;
+    w = clampEven(Math.round(w * 0.7));
+    h = clampEven(Math.round(h * 0.7));
+    fb = w * h * 4;
   }
 
   const { data, info } = await sharp(buf, { pages: -1 })
     .resize(w, h, { fit: "fill" }).ensureAlpha().raw()
     .toBuffer({ resolveWithObject: true });
 
-  const frameW = info.width;
-  const frameH = Math.round(info.height / pages);
+  const frameW = info.width, frameH = Math.round(info.height / pages);
   fb = frameW * frameH * 4;
   const frameCount = Math.min(pages, Math.floor(data.length / fb));
-  const delays = srcDelays.slice(0, frameCount);
+
+  // Write all raw frame data to single file
+  const rawPath = path.join(cacheDir, "frames.raw");
+  fs.writeFileSync(rawPath, data.subarray(0, frameCount * fb));
+
   const framesPerSeg = Math.max(1, Math.floor(MAX_RESPONSE / fb));
 
-  console.log(`GIF: ${frameW}x${frameH}, ${frameCount} frames, ${Math.ceil(frameCount / framesPerSeg)} segs`);
-  return {
-    format: "gif", width: frameW, height: frameH, fb, frameCount, delays,
+  const gifMeta = {
+    format: "gif", width: frameW, height: frameH, fb,
+    frameCount, delays: delays.slice(0, frameCount),
     framesPerSeg, totalSegments: Math.ceil(frameCount / framesPerSeg),
-    rawData: data,
   };
+  writeMeta(cacheDir, gifMeta);
+  return { cacheDir, meta: gifMeta };
 }
 
-async function processVideo(buf) {
+// ─── Video: probe once, process ALL frames once with single ffmpeg call ───
+async function ensureVideoProcessed(url) {
+  const { cacheDir, srcPath } = await ensureSource(url);
+  const meta = readMeta(cacheDir);
+  if (meta && meta.format === "video") {
+    const rawPath = path.join(cacheDir, "frames.raw");
+    if (fs.existsSync(rawPath)) return { cacheDir, meta };
+  }
+
   if (!ffmpegPath) throw new Error("ffmpeg not available");
 
-  const dir = makeTmp("vid");
-  const inp = path.join(dir, "in");
-  fs.writeFileSync(inp, buf);
-
-  // Probe (async)
-  const { stderr: probe } = await runFF(["-i", inp], 8000);
+  // Probe
+  let probe = "";
+  try {
+    probe = execSync(`${ffmpegPath} -i ${srcPath} 2>&1`, { encoding: "utf8", timeout: 5000 });
+  } catch (e) {
+    probe = (e.stderr || e.stdout || e.message || "").toString();
+  }
 
   let dur = 10;
   const dm = probe.match(/Duration:\s*(\d+):(\d+):(\d+)\.(\d+)/);
@@ -178,17 +152,13 @@ async function processVideo(buf) {
   const fb = outW * outH * 4;
 
   // ONE ffmpeg call for ALL frames
-  const rawPath = path.join(dir, "all.raw");
-  console.log(`FFmpeg: ${sw}x${sh} → ${outW}x${outH} @${fps}fps, ${dur.toFixed(1)}s …`);
-
-  const { err } = await runFF([
-    "-y", "-i", inp,
-    "-vf", `scale=${outW}:${outH}:flags=bilinear,fps=${fps}`,
-    "-pix_fmt", "rgba", "-f", "rawvideo", rawPath,
-  ], 180000);
-
-  // Clean input immediately
-  try { fs.unlinkSync(inp); } catch {}
+  const rawPath = path.join(cacheDir, "frames.raw");
+  execSync(
+    `${ffmpegPath} -y -i ${srcPath} ` +
+    `-vf "scale=${outW}:${outH}:flags=bilinear,fps=${fps}" ` +
+    `-pix_fmt rgba -f rawvideo ${rawPath}`,
+    { timeout: 25000, maxBuffer: 10 * 1024 * 1024 }
+  );
 
   if (!fs.existsSync(rawPath)) throw new Error("FFmpeg produced no output");
 
@@ -197,82 +167,138 @@ async function processVideo(buf) {
   if (frameCount === 0) throw new Error("No frames extracted");
 
   const delayMs = Math.round(1000 / fps);
-  const delays = Array(frameCount).fill(delayMs);
   const framesPerSeg = Math.max(1, Math.floor(MAX_RESPONSE / fb));
-  const totalSegments = Math.ceil(frameCount / framesPerSeg);
 
-  console.log(`Video: ${outW}x${outH}, ${frameCount} frames, ${totalSegments} segs, ${(rawSize / 1048576).toFixed(1)}MB raw`);
-
-  return {
-    format: "video", width: outW, height: outH, fps, duration: dur,
-    fb, frameCount, delays, framesPerSeg, totalSegments, rawPath, dir,
+  const videoMeta = {
+    format: "video", width: outW, height: outH, fps, duration: dur, fb,
+    frameCount, delays: Array(frameCount).fill(delayMs),
+    framesPerSeg, totalSegments: Math.ceil(frameCount / framesPerSeg),
   };
+  writeMeta(cacheDir, videoMeta);
+  return { cacheDir, meta: videoMeta };
 }
 
-// ─── Handler ─────────────────────────────────────────────
+// ─── Unified handler: images too ───
+async function ensureImageProcessed(url) {
+  const { cacheDir, srcPath, buf: dlBuf } = await ensureSource(url);
+  const meta = readMeta(cacheDir);
+  if (meta && meta.format === "image") return { cacheDir, meta };
+
+  const buf = getSourceBuf(srcPath, dlBuf);
+  const TARGET = 4096;
+  let pipeline = sharp(buf).ensureAlpha();
+  const sharpMeta = await sharp(buf).metadata();
+
+  if (sharpMeta.width > TARGET || sharpMeta.height > TARGET)
+    pipeline = pipeline.resize(TARGET, TARGET, { fit: "inside", withoutEnlargement: true });
+
+  const { data, info } = await pipeline.raw().toBuffer({ resolveWithObject: true });
+
+  const rawPath = path.join(cacheDir, "image.raw");
+  fs.writeFileSync(rawPath, data);
+
+  const imgMeta = {
+    format: "image", width: info.width, height: info.height,
+    fb: info.width * info.height * 4, totalSegments: 1,
+  };
+  writeMeta(cacheDir, imgMeta);
+  return { cacheDir, meta: imgMeta };
+}
+
+// ─── Detect type and process ───
+async function ensureProcessed(url) {
+  const cacheDir = getCacheDir(url);
+  const existing = readMeta(cacheDir);
+  if (existing) {
+    const rawFile = existing.format === "image" ? "image.raw" : "frames.raw";
+    if (fs.existsSync(path.join(cacheDir, rawFile))) {
+      return { cacheDir, meta: existing };
+    }
+  }
+
+  // Download source
+  const { srcPath, buf: dlBuf } = await ensureSource(url);
+  const buf = getSourceBuf(srcPath, dlBuf);
+
+  // Detect type
+  let sharpMeta;
+  try { sharpMeta = await sharp(buf).metadata(); } catch { sharpMeta = null; }
+
+  if (sharpMeta && sharpMeta.pages && sharpMeta.pages > 1) {
+    return await ensureGifProcessed(url);
+  }
+
+  if (sharpMeta && sharpMeta.width && sharpMeta.height) {
+    return await ensureImageProcessed(url);
+  }
+
+  return await ensureVideoProcessed(url);
+}
+
+// ─── Main handler ───
 module.exports = async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Cache-Control", "s-maxage=300, stale-while-revalidate=600");
   const { url, segment } = req.query;
   if (!url) return res.status(400).json({ error: "Missing ?url=" });
 
   try {
-    const data = await processUrl(url);
+    const { cacheDir, meta } = await ensureProcessed(url);
 
     // ── Probe (no segment) ──
     if (segment === undefined) {
       return res.json({
-        format: data.format,
-        width: data.width,
-        height: data.height,
-        fps: data.fps || 0,
-        duration: data.duration || 0,
-        frameCount: data.frameCount,
-        delays: data.delays,
-        totalSegments: data.totalSegments,
+        format: meta.format,
+        width: meta.width,
+        height: meta.height,
+        fps: meta.fps || 0,
+        duration: meta.duration || 0,
+        frameCount: meta.frameCount || 1,
+        delays: meta.delays || [0],
+        totalSegments: meta.totalSegments,
       });
     }
 
-    // ── Segment request ──
     const si = parseInt(segment);
 
-    // Image: return header + pixel data
-    if (data.format === "image") {
+    // ── Image ──
+    if (meta.format === "image") {
+      const rawPath = path.join(cacheDir, "image.raw");
+      const data = fs.readFileSync(rawPath);
       const header = Buffer.alloc(8);
-      header.writeUInt32LE(data.width, 0);
-      header.writeUInt32LE(data.height, 4);
+      header.writeUInt32LE(meta.width, 0);
+      header.writeUInt32LE(meta.height, 4);
       res.setHeader("Content-Type", "application/octet-stream");
-      return res.send(Buffer.concat([header, data.imageData]));
+      return res.send(Buffer.concat([header, data]));
     }
 
-    // Video / GIF: return frame slice
-    const start = si * data.framesPerSeg;
-    const end = Math.min(start + data.framesPerSeg, data.frameCount);
-    const count = end - start;
+    // ── Video / GIF segments: just read slice from cached raw file ──
+    const rawPath = path.join(cacheDir, "frames.raw");
+    const start = si * meta.framesPerSeg;
+    const end2 = Math.min(start + meta.framesPerSeg, meta.frameCount);
+    const count = end2 - start;
 
     if (count <= 0) {
-      const out = Buffer.alloc(4); out.writeUInt32LE(0, 0);
+      const out = Buffer.alloc(4);
+      out.writeUInt32LE(0, 0);
       res.setHeader("Content-Type", "application/octet-stream");
       return res.send(out);
     }
 
-    const payloadSize = 4 + data.fb * count;
-    const out = Buffer.alloc(payloadSize);
+    const payloadBytes = meta.fb * count;
+    const out = Buffer.alloc(4 + payloadBytes);
     out.writeUInt32LE(count, 0);
 
-    if (data.format === "gif") {
-      data.rawData.copy(out, 4, start * data.fb, start * data.fb + data.fb * count);
-    } else {
-      // Read slice from raw file (no re-download, no re-process!)
-      const fd = fs.openSync(data.rawPath, "r");
-      fs.readSync(fd, out, 4, data.fb * count, start * data.fb);
-      fs.closeSync(fd);
-    }
+    // Read just the slice we need (not the entire file)
+    const fd = fs.openSync(rawPath, "r");
+    fs.readSync(fd, out, 4, payloadBytes, start * meta.fb);
+    fs.closeSync(fd);
 
     res.setHeader("Content-Type", "application/octet-stream");
     return res.send(out);
 
   } catch (e) {
-    console.error("frames error:", e.message);
+    console.error("frames:", e.message);
     return res.status(500).json({ error: e.message });
   }
 };

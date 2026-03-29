@@ -7,12 +7,12 @@ const crypto = require("crypto");
 let ffmpegPath;
 try { ffmpegPath = require("ffmpeg-static"); } catch { ffmpegPath = null; }
 
-const MAX_VIDEO_DIM = 360;
-const MAX_VIDEO_FPS = 24;
+const MAX_VIDEO_DIM = 450;
+const MAX_VIDEO_FPS = 30;
 const MAX_GIF_DIM = 512;
 const MAX_RESPONSE = 4500000;
 const DEFAULT_DELAY = 100;
-const MAX_VIDEO_DURATION = 20;
+const MAX_VIDEO_DURATION = 300;
 
 function clampEven(n) {
   n = Math.max(2, Math.round(n));
@@ -188,7 +188,7 @@ async function processVideo(cacheDir, srcPath) {
   // Use fast bilinear scaling, limit duration
   execSync(
     `${ffmpegPath} -y -t ${dur.toFixed(3)} -i ${srcPath} ` +
-    `-vf "scale=${outW}:${outH}:flags=fast_bilinear,fps=${fps}" ` +
+    `-vf "scale=${outW}:${outH}:flags=bilinear,fps=${fps}" ` +
     `-pix_fmt rgba -f rawvideo ${rawPath}`,
     { timeout: 22000, maxBuffer: 10 * 1024 * 1024 }
   );
